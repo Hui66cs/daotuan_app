@@ -1,0 +1,5 @@
+{
+  "name": "Nested Modules Workspace",
+  "description": "A hierarchical workspace application where you can create nested modules, add text, and upload images.",
+  "requestFramePermissions": []
+}
