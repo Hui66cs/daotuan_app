@@ -3,9 +3,65 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useRef } from 'react';
-import { Folder, FileText, Image as ImageIcon, Plus, ChevronRight, ChevronDown, Home, Trash2, Edit2, X } from 'lucide-react';
+import React, { useState, useEffect, useRef, Component, ErrorInfo, ReactNode } from 'react';
+import { Folder, FileText, Image as ImageIcon, Plus, ChevronRight, ChevronDown, Home, Trash2, Edit2, X, AlertCircle } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
+import { db, auth, storage } from './firebase';
+import { 
+  collection, 
+  doc, 
+  setDoc, 
+  deleteDoc, 
+  onSnapshot, 
+  getDocFromServer,
+  writeBatch
+} from 'firebase/firestore';
+import { signInAnonymously, onAuthStateChanged } from 'firebase/auth';
+import { ref, uploadBytes, getDownloadURL, deleteObject } from 'firebase/storage';
+
+// Error Boundary Component
+class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boolean, errorInfo: string | null }> {
+  constructor(props: { children: ReactNode }) {
+    super(props);
+    this.state = { hasError: false, errorInfo: null };
+  }
+
+  static getDerivedStateFromError(error: any) {
+    return { hasError: true, errorInfo: error.message };
+  }
+
+  componentDidCatch(error: Error, errorInfo: ErrorInfo) {
+    console.error("ErrorBoundary caught an error", error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen flex items-center justify-center bg-gray-50 p-4">
+          <div className="max-w-md w-full bg-white rounded-2xl shadow-xl p-8 border border-red-100">
+            <div className="flex items-center gap-3 text-red-600 mb-4">
+              <AlertCircle className="w-8 h-8" />
+              <h2 className="text-xl font-bold">Something went wrong</h2>
+            </div>
+            <p className="text-gray-600 mb-6">
+              The application encountered an error. This might be due to a connection issue or security rules.
+            </p>
+            <div className="bg-red-50 p-4 rounded-lg mb-6 overflow-auto max-h-40">
+              <code className="text-xs text-red-800">{this.state.errorInfo}</code>
+            </div>
+            <button 
+              onClick={() => window.location.reload()}
+              className="w-full bg-red-600 text-white py-2 rounded-xl font-medium hover:bg-red-700 transition-colors"
+            >
+              Reload Application
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 type Module = {
   id: string;
@@ -16,6 +72,36 @@ type Module = {
   parentId: string | null;
   children: string[];
 };
+
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: any;
+}
+
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+    },
+    operationType,
+    path
+  };
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
 
 const generateId = () => Math.random().toString(36).substring(2, 9);
 
@@ -53,34 +139,79 @@ const AutoResizeTextarea = ({ value, onChange, placeholder, className }: any) =>
   );
 };
 
-export default function App() {
-  const [modules, setModules] = useState<Record<string, Module>>(() => {
-    const saved = localStorage.getItem('nested-modules-data');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        // Migration: ensure all modules have a summary field
-        Object.keys(parsed).forEach(key => {
-          if (parsed[key].summary === undefined) {
-            parsed[key].summary = '';
-          }
-        });
-        return parsed;
-      } catch (e) {
-        console.error(e);
-      }
-    }
-    return initialModules;
-  });
+export default function AppWrapper() {
+  return (
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
+  );
+}
 
+function App() {
+  const [modules, setModules] = useState<Record<string, Module>>({});
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isUploading, setIsUploading] = useState(false);
   const [currentId, setCurrentId] = useState<string>('root');
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [editTitleValue, setEditTitleValue] = useState('');
   const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set(['root']));
 
+  // 1. Handle Authentication
   useEffect(() => {
-    localStorage.setItem('nested-modules-data', JSON.stringify(modules));
-  }, [modules]);
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      if (!user) {
+        try {
+          await signInAnonymously(auth);
+        } catch (error) {
+          console.error("Anonymous sign-in failed", error);
+        }
+      } else {
+        setIsAuthReady(true);
+      }
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // 2. Test Connection
+  useEffect(() => {
+    if (!isAuthReady) return;
+    async function testConnection() {
+      try {
+        await getDocFromServer(doc(db, 'modules', 'root'));
+      } catch (error) {
+        if (error instanceof Error && error.message.includes('the client is offline')) {
+          console.error("Please check your Firebase configuration.");
+        }
+      }
+    }
+    testConnection();
+  }, [isAuthReady]);
+
+  // 3. Real-time Sync
+  useEffect(() => {
+    if (!isAuthReady) return;
+
+    const unsubscribe = onSnapshot(collection(db, 'modules'), (snapshot) => {
+      const newModules: Record<string, Module> = {};
+      snapshot.forEach((doc) => {
+        newModules[doc.id] = doc.data() as Module;
+      });
+
+      // If root is missing, initialize it
+      if (Object.keys(newModules).length === 0) {
+        setDoc(doc(db, 'modules', 'root'), initialModules.root)
+          .catch(e => handleFirestoreError(e, OperationType.WRITE, 'modules/root'));
+      } else {
+        setModules(newModules);
+        setIsLoading(false);
+      }
+    }, (error) => {
+      handleFirestoreError(error, OperationType.GET, 'modules');
+    });
+
+    return () => unsubscribe();
+  }, [isAuthReady]);
 
   const currentModule = modules[currentId];
 
@@ -111,7 +242,7 @@ export default function App() {
     }
   };
 
-  const addModule = () => {
+  const addModule = async () => {
     const newId = generateId();
     const newModule: Module = {
       id: newId,
@@ -123,19 +254,20 @@ export default function App() {
       children: [],
     };
 
-    setModules(prev => ({
-      ...prev,
-      [newId]: newModule,
-      [currentId]: {
-        ...prev[currentId],
-        children: [...prev[currentId].children, newId]
-      }
-    }));
-    
-    setExpandedNodes(prev => new Set(prev).add(currentId));
+    try {
+      const batch = writeBatch(db);
+      batch.set(doc(db, 'modules', newId), newModule);
+      batch.update(doc(db, 'modules', currentId), {
+        children: [...modules[currentId].children, newId]
+      });
+      await batch.commit();
+      setExpandedNodes(prev => new Set(prev).add(currentId));
+    } catch (e) {
+      handleFirestoreError(e, OperationType.WRITE, `modules/${newId}`);
+    }
   };
 
-  const deleteModule = (idToDelete: string, e: React.MouseEvent) => {
+  const deleteModule = async (idToDelete: string, e: React.MouseEvent) => {
     e.stopPropagation();
     if (!window.confirm('Are you sure you want to delete this module and all its contents?')) return;
 
@@ -152,84 +284,117 @@ export default function App() {
     const descendants = getDescendants(idToDelete, modules);
     const idsToRemove = [idToDelete, ...descendants];
 
-    setModules(prev => {
-      const next = { ...prev };
-      const parentId = next[idToDelete].parentId;
+    try {
+      const batch = writeBatch(db);
+      const parentId = modules[idToDelete].parentId;
       
-      if (parentId && next[parentId]) {
-        next[parentId] = {
-          ...next[parentId],
-          children: next[parentId].children.filter(id => id !== idToDelete)
-        };
+      if (parentId && modules[parentId]) {
+        batch.update(doc(db, 'modules', parentId), {
+          children: modules[parentId].children.filter(id => id !== idToDelete)
+        });
       }
 
+      // Delete images from Storage for all removed modules
       for (const id of idsToRemove) {
-        delete next[id];
+        const mod = modules[id];
+        if (mod && mod.images.length > 0) {
+          for (const imageUrl of mod.images) {
+            try {
+              // Only delete if it's a Firebase Storage URL
+              if (imageUrl.includes('firebasestorage.googleapis.com')) {
+                const imageRef = ref(storage, imageUrl);
+                await deleteObject(imageRef);
+              }
+            } catch (err) {
+              console.warn("Failed to delete image from storage:", imageUrl, err);
+            }
+          }
+        }
+        batch.delete(doc(db, 'modules', id));
       }
 
-      return next;
-    });
-
-    if (idsToRemove.includes(currentId)) {
-      setCurrentId('root');
+      await batch.commit();
+      if (idsToRemove.includes(currentId)) {
+        setCurrentId('root');
+      }
+    } catch (e) {
+      handleFirestoreError(e, OperationType.DELETE, `modules/${idToDelete}`);
     }
   };
 
-  const updateText = (text: string) => {
-    setModules(prev => ({
-      ...prev,
-      [currentId]: { ...prev[currentId], text }
-    }));
+  const updateText = async (text: string) => {
+    try {
+      await setDoc(doc(db, 'modules', currentId), { ...modules[currentId], text });
+    } catch (e) {
+      handleFirestoreError(e, OperationType.WRITE, `modules/${currentId}`);
+    }
   };
 
-  const updateSummary = (summary: string) => {
-    setModules(prev => ({
-      ...prev,
-      [currentId]: { ...prev[currentId], summary }
-    }));
+  const updateSummary = async (summary: string) => {
+    try {
+      await setDoc(doc(db, 'modules', currentId), { ...modules[currentId], summary });
+    } catch (e) {
+      handleFirestoreError(e, OperationType.WRITE, `modules/${currentId}`);
+    }
   };
 
-  const handleTitleEditSave = () => {
+  const handleTitleEditSave = async () => {
     if (editTitleValue.trim()) {
-      setModules(prev => ({
-        ...prev,
-        [currentId]: { ...prev[currentId], title: editTitleValue.trim() }
-      }));
+      try {
+        await setDoc(doc(db, 'modules', currentId), { ...modules[currentId], title: editTitleValue.trim() });
+      } catch (e) {
+        handleFirestoreError(e, OperationType.WRITE, `modules/${currentId}`);
+      }
     }
     setIsEditingTitle(false);
   };
 
-  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
-    if (!files) return;
+    if (!files || files.length === 0) return;
 
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      const reader = new FileReader();
-      reader.onload = (event) => {
-        const dataUrl = event.target?.result as string;
-        setModules(prev => ({
-          ...prev,
-          [currentId]: {
-            ...prev[currentId],
-            images: [...prev[currentId].images, dataUrl]
-          }
-        }));
-      };
-      reader.readAsDataURL(file);
+    setIsUploading(true);
+    const newImageUrls: string[] = [];
+
+    try {
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const fileName = `${currentId}/${Date.now()}-${file.name}`;
+        const imageRef = ref(storage, `images/${fileName}`);
+        
+        const snapshot = await uploadBytes(imageRef, file);
+        const downloadUrl = await getDownloadURL(snapshot.ref);
+        newImageUrls.push(downloadUrl);
+      }
+
+      await setDoc(doc(db, 'modules', currentId), {
+        ...modules[currentId],
+        images: [...modules[currentId].images, ...newImageUrls]
+      });
+    } catch (e) {
+      handleFirestoreError(e, OperationType.WRITE, `modules/${currentId}`);
+    } finally {
+      setIsUploading(false);
+      e.target.value = '';
     }
-    
-    e.target.value = '';
   };
 
-  const removeImage = (indexToRemove: number) => {
-    setModules(prev => ({
-      ...prev,
-      [currentId]: {
-        ...prev[currentId],
-        images: prev[currentId].images.filter((_, i) => i !== indexToRemove)
+  const removeImage = async (indexToRemove: number) => {
+    const imageUrl = modules[currentId].images[indexToRemove];
+    try {
+      // Delete from Storage if it's a Firebase Storage URL
+      if (imageUrl.includes('firebasestorage.googleapis.com')) {
+        const imageRef = ref(storage, imageUrl);
+        await deleteObject(imageRef);
       }
-    }));
+
+      await setDoc(doc(db, 'modules', currentId), {
+        ...modules[currentId],
+        images: modules[currentId].images.filter((_, i) => i !== indexToRemove)
+      });
+    } catch (e) {
+      handleFirestoreError(e, OperationType.WRITE, `modules/${currentId}`);
+    }
   };
 
   // Recursive Tree Node Component
@@ -273,6 +438,17 @@ export default function App() {
       </div>
     );
   };
+
+  if (isLoading) {
+    return (
+      <div className="h-screen flex items-center justify-center bg-gray-50">
+        <div className="flex flex-col items-center gap-4">
+          <div className="w-12 h-12 border-4 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+          <p className="text-gray-500 font-medium">Connecting to workspace...</p>
+        </div>
+      </div>
+    );
+  }
 
   if (!currentModule) {
     return (
@@ -402,10 +578,14 @@ export default function App() {
 
                     {/* Toolbar */}
                     <div className="bg-gray-50 px-6 py-3 border-t border-gray-200 flex items-center gap-4">
-                      <label className="flex items-center gap-2 text-sm font-medium text-gray-600 hover:text-gray-900 cursor-pointer transition-colors px-3 py-1.5 rounded-md hover:bg-gray-200">
-                        <ImageIcon className="w-4 h-4" />
-                        Add Image
-                        <input type="file" accept="image/*" multiple className="hidden" onChange={handleImageUpload} />
+                      <label className={`flex items-center gap-2 text-sm font-medium transition-colors px-3 py-1.5 rounded-md ${isUploading ? 'text-gray-400 cursor-not-allowed' : 'text-gray-600 hover:text-gray-900 cursor-pointer hover:bg-gray-200'}`}>
+                        {isUploading ? (
+                          <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+                        ) : (
+                          <ImageIcon className="w-4 h-4" />
+                        )}
+                        {isUploading ? 'Uploading...' : 'Add Image'}
+                        <input type="file" accept="image/*" multiple className="hidden" onChange={handleImageUpload} disabled={isUploading} />
                       </label>
                     </div>
                   </section>

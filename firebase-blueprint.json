@@ -1,0 +1,26 @@
+{
+  "entities": {
+    "Module": {
+      "title": "Module",
+      "description": "A module in the nested workspace",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string" },
+        "summary": { "type": "string" },
+        "text": { "type": "string" },
+        "images": { "type": "array", "items": { "type": "string" }, "description": "List of download URLs for images stored in Firebase Storage" },
+        "parentId": { "type": "string" },
+        "children": { "type": "array", "items": { "type": "string" } },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "title"]
+    }
+  },
+  "firestore": {
+    "/modules/{moduleId}": {
+      "schema": "Module",
+      "description": "Collection of all modules in the workspace"
+    }
+  }
+}
