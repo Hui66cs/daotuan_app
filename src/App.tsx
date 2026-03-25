@@ -127,20 +127,57 @@ const initialModules: Record<string, Module> = {
 };
 
 const AutoResizeTextarea = ({ value, onChange, placeholder, className }: any) => {
+  const [localValue, setLocalValue] = useState(value);
   const ref = useRef<HTMLTextAreaElement>(null);
+  const isComposingStr = useRef(false);
   
+  // Update local value when prop value changes, but only if it's different and we are not composing
+  useEffect(() => {
+    if (!isComposingStr.current && value !== localValue) {
+      setLocalValue(value);
+    }
+  }, [value]);
+
   useEffect(() => {
     if (ref.current) {
       ref.current.style.height = 'auto';
       ref.current.style.height = ref.current.scrollHeight + 'px';
     }
-  }, [value]);
+  }, [localValue]);
+
+  // Debounced save to prevent rapid writes and input interruptions
+  useEffect(() => {
+    const handler = setTimeout(() => {
+      if (localValue !== value) {
+        onChange({ target: { value: localValue } });
+      }
+    }, 500); // 500ms delay
+
+    return () => clearTimeout(handler);
+  }, [localValue]);
+
+  const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    setLocalValue(e.target.value);
+  };
+
+  const handleCompositionStart = () => {
+    isComposingStr.current = true;
+  };
+
+  const handleCompositionEnd = (e: React.CompositionEvent<HTMLTextAreaElement>) => {
+    isComposingStr.current = false;
+    // Trigger an update after composition ends
+    // (e.target as HTMLTextAreaElement).value contains the final composed string
+    setLocalValue((e.target as HTMLTextAreaElement).value);
+  };
 
   return (
     <textarea
       ref={ref}
-      value={value}
-      onChange={onChange}
+      value={localValue}
+      onChange={handleChange}
+      onCompositionStart={handleCompositionStart}
+      onCompositionEnd={handleCompositionEnd}
       placeholder={placeholder}
       className={className}
       rows={1}
@@ -548,6 +585,7 @@ function App() {
                 <div>
                   <label className="block text-sm font-semibold text-gray-700 mb-2 uppercase tracking-wider">Summary (简介)</label>
                   <AutoResizeTextarea
+                    key={`summary-${currentId}`}
                     value={currentModule.summary}
                     onChange={(e: any) => updateSummary(e.target.value)}
                     placeholder="Add a brief summary for this module..."
@@ -561,6 +599,7 @@ function App() {
                   <section className="bg-white rounded-2xl shadow-sm border border-gray-200 overflow-hidden">
                     <div className="p-6">
                       <AutoResizeTextarea
+                        key={`text-${currentId}`}
                         value={currentModule.text}
                         onChange={(e: any) => updateText(e.target.value)}
                         placeholder="Write your detailed content here..."
