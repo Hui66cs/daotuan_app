@@ -17,7 +17,7 @@ import {
   writeBatch
 } from 'firebase/firestore';
 import { signInAnonymously, onAuthStateChanged } from 'firebase/auth';
-import { ref, uploadBytes, getDownloadURL, deleteObject } from 'firebase/storage';
+import { ref, uploadBytes, getDownloadURL, deleteObject, uploadBytesResumable } from 'firebase/storage';
 
 interface ErrorBoundaryProps {
   children: ReactNode;
@@ -198,6 +198,7 @@ function App() {
   const [isAuthReady, setIsAuthReady] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [isUploading, setIsUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
   const [currentId, setCurrentId] = useState<string>('root');
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [editTitleValue, setEditTitleValue] = useState('');
@@ -400,16 +401,38 @@ function App() {
     if (!files || files.length === 0) return;
 
     setIsUploading(true);
+    setUploadProgress(0);
     const newImageUrls: string[] = [];
 
     try {
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
+        
+        // Check for file size (10MB) before starting upload to fail fast
+        if (file.size > 10 * 1024 * 1024) {
+          throw new Error(`File ${file.name} is too large (max 10MB)`);
+        }
+
         const fileName = `${currentId}/${Date.now()}-${file.name}`;
         const imageRef = ref(storage, `images/${fileName}`);
         
-        const snapshot = await uploadBytes(imageRef, file);
-        const downloadUrl = await getDownloadURL(snapshot.ref);
+        const uploadTask = uploadBytesResumable(imageRef, file);
+        
+        await new Promise<void>((resolve, reject) => {
+          uploadTask.on('state_changed',
+            (snapshot) => {
+              const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
+              setUploadProgress(progress);
+            },
+            (error) => {
+              console.error("Upload failed", error);
+              reject(error);
+            },
+            () => resolve()
+          );
+        });
+
+        const downloadUrl = await getDownloadURL(uploadTask.snapshot.ref);
         newImageUrls.push(downloadUrl);
       }
 
@@ -421,6 +444,7 @@ function App() {
       handleFirestoreError(e, OperationType.WRITE, `modules/${currentId}`);
     } finally {
       setIsUploading(false);
+      setUploadProgress(0);
       e.target.value = '';
     }
   };
@@ -628,7 +652,10 @@ function App() {
                     <div className="bg-gray-50 px-6 py-3 border-t border-gray-200 flex items-center gap-4">
                       <label className={`flex items-center gap-2 text-sm font-medium transition-colors px-3 py-1.5 rounded-md ${isUploading ? 'text-gray-400 cursor-not-allowed' : 'text-gray-600 hover:text-gray-900 cursor-pointer hover:bg-gray-200'}`}>
                         {isUploading ? (
-                          <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+                          <div className="flex items-center gap-2">
+                             <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+                             <span className="text-xs">{Math.round(uploadProgress)}%</span>
+                          </div>
                         ) : (
                           <ImageIcon className="w-4 h-4" />
                         )}
