@@ -3,21 +3,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useRef, Component, ErrorInfo, ReactNode } from 'react';
-import { Folder, FileText, Image as ImageIcon, Plus, ChevronRight, ChevronDown, Home, Trash2, Edit2, X, AlertCircle } from 'lucide-react';
+import * as React from 'react';
+import { useState, useEffect, useRef, Component, ErrorInfo, ReactNode } from 'react';
+import { Folder, FileText, Image as ImageIcon, Plus, ChevronRight, ChevronDown, Home, Trash2, Edit2, X, AlertCircle, Maximize, ZoomIn, ZoomOut, Network } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { db, auth, storage } from './firebase';
-import { 
-  collection, 
-  doc, 
-  setDoc, 
-  deleteDoc, 
-  onSnapshot, 
-  getDocFromServer,
-  writeBatch
-} from 'firebase/firestore';
-import { signInAnonymously, onAuthStateChanged } from 'firebase/auth';
-import { ref, uploadBytes, getDownloadURL, deleteObject, uploadBytesResumable } from 'firebase/storage';
+import { supabase } from './supabase';
 
 interface ErrorBoundaryProps {
   children: ReactNode;
@@ -98,17 +88,14 @@ interface FirestoreErrorInfo {
   authInfo: any;
 }
 
-function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+function handleSupabaseError(error: unknown, operationType: OperationType, path: string | null) {
   const errInfo: FirestoreErrorInfo = {
     error: error instanceof Error ? error.message : String(error),
-    authInfo: {
-      userId: auth.currentUser?.uid,
-      email: auth.currentUser?.email,
-    },
+    authInfo: null,
     operationType,
     path
   };
-  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  console.error('Supabase Error: ', JSON.stringify(errInfo));
   throw new Error(JSON.stringify(errInfo));
 }
 
@@ -204,20 +191,24 @@ function App() {
   const [editTitleValue, setEditTitleValue] = useState('');
   const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set(['root']));
 
+  // Map View State
+  const [showMapView, setShowMapView] = useState(true);
+  const [panZoom, setPanZoom] = useState({ x: 50, y: 50, scale: 1 });
+  const [isDraggingMap, setIsDraggingMap] = useState(false);
+  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
+  const mapContainerRef = useRef<HTMLDivElement>(null);
+  const [dragNode, setDragNode] = useState<{ id: string, dx: number, dy: number, startX: number, startY: number, hasDragged: boolean } | null>(null);
+
   // 1. Handle Authentication
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (user) => {
-      if (!user) {
-        try {
-          await signInAnonymously(auth);
-        } catch (error) {
-          console.error("Anonymous sign-in failed", error);
-        }
-      } else {
-        setIsAuthReady(true);
+    const initAuth = async () => {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) {
+        await supabase.auth.signInAnonymously();
       }
-    });
-    return () => unsubscribe();
+      setIsAuthReady(true);
+    };
+    initAuth();
   }, []);
 
   // 2. Test Connection
@@ -225,11 +216,9 @@ function App() {
     if (!isAuthReady) return;
     async function testConnection() {
       try {
-        await getDocFromServer(doc(db, 'modules', 'root'));
+        await supabase.from('modules').select('*').limit(1);
       } catch (error) {
-        if (error instanceof Error && error.message.includes('the client is offline')) {
-          console.error("Please check your Firebase configuration.");
-        }
+        console.error("Please check your Supabase configuration.", error);
       }
     }
     testConnection();
@@ -239,25 +228,49 @@ function App() {
   useEffect(() => {
     if (!isAuthReady) return;
 
-    const unsubscribe = onSnapshot(collection(db, 'modules'), (snapshot) => {
-      const newModules: Record<string, Module> = {};
-      snapshot.forEach((doc) => {
-        newModules[doc.id] = doc.data() as Module;
-      });
-
-      // If root is missing, initialize it
-      if (Object.keys(newModules).length === 0) {
-        setDoc(doc(db, 'modules', 'root'), initialModules.root)
-          .catch(e => handleFirestoreError(e, OperationType.WRITE, 'modules/root'));
-      } else {
-        setModules(newModules);
-        setIsLoading(false);
+    const fetchModules = async () => {
+      const { data, error } = await supabase.from('modules').select('*');
+      if (error) {
+         console.error('Fetch error:', error);
+         return;
       }
-    }, (error) => {
-      handleFirestoreError(error, OperationType.GET, 'modules');
-    });
+      
+      const newModules: Record<string, Module> = {};
+      if (data) {
+        data.forEach((row: any) => {
+          newModules[row.id] = row as Module;
+        });
+      }
 
-    return () => unsubscribe();
+      if (Object.keys(newModules).length === 0) {
+        await supabase.from('modules').insert(initialModules.root);
+        newModules['root'] = initialModules.root;
+      }
+      
+      setModules(newModules);
+      setIsLoading(false);
+    };
+
+    fetchModules();
+
+    const channel = supabase
+      .channel('schema-db-changes')
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'modules',
+        },
+        () => {
+           fetchModules();
+        }
+      )
+      .subscribe();
+
+    return () => {
+      if (channel) supabase.removeChannel(channel);
+    };
   }, [isAuthReady]);
 
   const currentModule = modules[currentId];
@@ -269,6 +282,147 @@ function App() {
     breadcrumbs.unshift({ id: curr.id, title: curr.title });
     curr = curr.parentId ? modules[curr.parentId] : null;
   }
+
+  // --- Map Layout Algorithm ---
+  const NODE_WIDTH = 220;
+  const NODE_HEIGHT = 70;
+  const HORIZONTAL_SPACING = 300;
+  const VERTICAL_SPACING = 90;
+
+  type LayoutNode = { id: string; title: string; depth: number; x: number; y: number; height: number };
+  type LayoutEdge = { fromId: string; fromX: number; fromY: number; toId: string; toX: number; toY: number };
+
+  const getSubtreeHeight = (id: string, mods: Record<string, Module>): number => {
+    const info = mods[id];
+    if (!info || info.children.length === 0) return VERTICAL_SPACING;
+    let childrenHeight = 0;
+    for (const childId of info.children) {
+      childrenHeight += getSubtreeHeight(childId, mods);
+    }
+    return Math.max(childrenHeight, VERTICAL_SPACING);
+  };
+
+  const layoutNodes: LayoutNode[] = [];
+  const layoutEdges: LayoutEdge[] = [];
+
+  const calculateLayout = (id: string, depth: number, currentY: number) => {
+    const info = modules[id];
+    if (!info) return currentY;
+    const subtreeHeight = getSubtreeHeight(id, modules);
+    const y = currentY + subtreeHeight / 2 - NODE_HEIGHT / 2;
+    const x = depth * HORIZONTAL_SPACING;
+
+    layoutNodes.push({ id, title: info.title, depth, x, y, height: NODE_HEIGHT });
+
+    let childY = currentY;
+    for (const childId of info.children) {
+      const childSubHeight = getSubtreeHeight(childId, modules);
+      const childYCenter = childY + childSubHeight / 2 - NODE_HEIGHT / 2;
+      const childX = (depth + 1) * HORIZONTAL_SPACING;
+
+      layoutEdges.push({
+        fromId: id,
+        fromX: x + NODE_WIDTH,
+        fromY: y + NODE_HEIGHT / 2,
+        toId: childId,
+        toX: childX,
+        toY: childYCenter + NODE_HEIGHT / 2
+      });
+
+      calculateLayout(childId, depth + 1, childY);
+      childY += childSubHeight;
+    }
+  };
+
+  if (modules.root) {
+    calculateLayout('root', 0, 0);
+  }
+
+  // Adjust initial map position
+  useEffect(() => {
+    if (showMapView && mapContainerRef.current && modules.root) {
+      const rect = mapContainerRef.current.getBoundingClientRect();
+      const treeHeight = getSubtreeHeight('root', modules);
+      setPanZoom(prev => {
+        if (prev.x === 50 && prev.y === 50) {
+          return { x: Math.max(50, rect.width * 0.1), y: Math.max(50, rect.height / 2 - treeHeight / 2), scale: 1 };
+        }
+        return prev;
+      });
+    }
+  }, [showMapView, Object.keys(modules).length]);
+
+  const handleMapPointerDown = (e: React.PointerEvent) => {
+    if ((e.target as HTMLElement).closest('.module-node') || (e.target as HTMLElement).closest('button')) return;
+    setIsDraggingMap(true);
+    setDragStart({ x: e.clientX - panZoom.x, y: e.clientY - panZoom.y });
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+
+  const handleMapPointerMove = (e: React.PointerEvent) => {
+    if (isDraggingMap) {
+      setPanZoom(prev => ({ ...prev, x: e.clientX - dragStart.x, y: e.clientY - dragStart.y }));
+    }
+  };
+
+  const handleMapPointerUp = (e: React.PointerEvent) => {
+    setIsDraggingMap(false);
+    if(e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+  };
+
+  const handleMapWheel = (e: React.WheelEvent) => {
+    const scaleAdjust = e.deltaY > 0 ? 0.9 : 1.1;
+    
+    if (mapContainerRef.current) {
+        const rect = mapContainerRef.current.getBoundingClientRect();
+        const mouseX = e.clientX - rect.left;
+        const mouseY = e.clientY - rect.top;
+
+        setPanZoom(prev => {
+          const newScale = Math.min(Math.max(0.1, prev.scale * scaleAdjust), 3);
+          const newX = mouseX - (mouseX - prev.x) * (newScale / prev.scale);
+          const newY = mouseY - (mouseY - prev.y) * (newScale / prev.scale);
+          return { x: newX, y: newY, scale: newScale };
+        });
+    }
+  };
+
+  const handleNodePointerDown = (e: React.PointerEvent, id: string) => {
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    setDragNode({ id, dx: 0, dy: 0, startX: e.clientX, startY: e.clientY, hasDragged: false });
+  };
+
+  const handleNodePointerMove = (e: React.PointerEvent) => {
+    if (dragNode) {
+      e.stopPropagation();
+      const dx = (e.clientX - dragNode.startX) / panZoom.scale;
+      const dy = (e.clientY - dragNode.startY) / panZoom.scale;
+      const hasDragged = dragNode.hasDragged || Math.abs(dx) > 3 || Math.abs(dy) > 3;
+      setDragNode(prev => prev ? { ...prev, dx, dy, hasDragged } : null);
+    }
+  };
+
+  const handleNodePointerUp = (e: React.PointerEvent, id: string) => {
+    e.stopPropagation();
+    e.currentTarget.releasePointerCapture(e.pointerId);
+    if (dragNode && !dragNode.hasDragged) {
+      navigateTo(id);
+      setShowMapView(false);
+    }
+    setDragNode(null);
+  };
+
+  const depthColors = [
+    'bg-blue-600 text-white border-blue-700 hover:shadow-blue-500/30',
+    'bg-indigo-600 text-white border-indigo-700 hover:shadow-indigo-500/30',
+    'bg-violet-600 text-white border-violet-700 hover:shadow-violet-500/30',
+    'bg-purple-600 text-white border-purple-700 hover:shadow-purple-500/30',
+    'bg-fuchsia-600 text-white border-fuchsia-700 hover:shadow-fuchsia-500/30',
+    'bg-pink-600 text-white border-pink-700 hover:shadow-pink-500/30'
+  ];
 
   const navigateTo = (id: string) => {
     setCurrentId(id);
@@ -302,15 +456,14 @@ function App() {
     };
 
     try {
-      const batch = writeBatch(db);
-      batch.set(doc(db, 'modules', newId), newModule);
-      batch.update(doc(db, 'modules', currentId), {
+      await supabase.from('modules').insert(newModule);
+      await supabase.from('modules').update({
         children: [...modules[currentId].children, newId]
-      });
-      await batch.commit();
+      }).eq('id', currentId);
+      
       setExpandedNodes(prev => new Set(prev).add(currentId));
     } catch (e) {
-      handleFirestoreError(e, OperationType.WRITE, `modules/${newId}`);
+      handleSupabaseError(e, OperationType.WRITE, `modules/${newId}`);
     }
   };
 
@@ -332,65 +485,64 @@ function App() {
     const idsToRemove = [idToDelete, ...descendants];
 
     try {
-      const batch = writeBatch(db);
       const parentId = modules[idToDelete].parentId;
       
       if (parentId && modules[parentId]) {
-        batch.update(doc(db, 'modules', parentId), {
+        await supabase.from('modules').update({
           children: modules[parentId].children.filter(id => id !== idToDelete)
-        });
+        }).eq('id', parentId);
       }
 
-      // Delete images from Storage for all removed modules
       for (const id of idsToRemove) {
         const mod = modules[id];
         if (mod && mod.images.length > 0) {
           for (const imageUrl of mod.images) {
             try {
-              // Only delete if it's a Firebase Storage URL
-              if (imageUrl.includes('firebasestorage.googleapis.com')) {
-                const imageRef = ref(storage, imageUrl);
-                await deleteObject(imageRef);
+              if (imageUrl.includes('supabase.co')) {
+                const pathMatches = imageUrl.match(/public\/images\/(.*)/);
+                if(pathMatches && pathMatches[1]) {
+                    const filePath = pathMatches[1];
+                    await supabase.storage.from('images').remove([filePath]);
+                }
               }
             } catch (err) {
               console.warn("Failed to delete image from storage:", imageUrl, err);
             }
           }
         }
-        batch.delete(doc(db, 'modules', id));
+        await supabase.from('modules').delete().eq('id', id);
       }
 
-      await batch.commit();
       if (idsToRemove.includes(currentId)) {
         setCurrentId('root');
       }
     } catch (e) {
-      handleFirestoreError(e, OperationType.DELETE, `modules/${idToDelete}`);
+      handleSupabaseError(e, OperationType.DELETE, `modules/${idToDelete}`);
     }
   };
 
   const updateText = async (text: string) => {
     try {
-      await setDoc(doc(db, 'modules', currentId), { ...modules[currentId], text });
+      await supabase.from('modules').update({ text }).eq('id', currentId);
     } catch (e) {
-      handleFirestoreError(e, OperationType.WRITE, `modules/${currentId}`);
+      handleSupabaseError(e, OperationType.WRITE, `modules/${currentId}`);      
     }
   };
 
   const updateSummary = async (summary: string) => {
     try {
-      await setDoc(doc(db, 'modules', currentId), { ...modules[currentId], summary });
+      await supabase.from('modules').update({ summary }).eq('id', currentId);
     } catch (e) {
-      handleFirestoreError(e, OperationType.WRITE, `modules/${currentId}`);
+      handleSupabaseError(e, OperationType.WRITE, `modules/${currentId}`);      
     }
   };
 
   const handleTitleEditSave = async () => {
     if (editTitleValue.trim()) {
       try {
-        await setDoc(doc(db, 'modules', currentId), { ...modules[currentId], title: editTitleValue.trim() });
+        await supabase.from('modules').update({ title: editTitleValue.trim() }).eq('id', currentId);
       } catch (e) {
-        handleFirestoreError(e, OperationType.WRITE, `modules/${currentId}`);
+        handleSupabaseError(e, OperationType.WRITE, `modules/${currentId}`);    
       }
     }
     setIsEditingTitle(false);
@@ -414,34 +566,20 @@ function App() {
         }
 
         const fileName = `${currentId}/${Date.now()}-${file.name}`;
-        const imageRef = ref(storage, `images/${fileName}`);
-        
-        const uploadTask = uploadBytesResumable(imageRef, file);
-        
-        await new Promise<void>((resolve, reject) => {
-          uploadTask.on('state_changed',
-            (snapshot) => {
-              const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
-              setUploadProgress(progress);
-            },
-            (error) => {
-              console.error("Upload failed", error);
-              reject(error);
-            },
-            () => resolve()
-          );
-        });
 
-        const downloadUrl = await getDownloadURL(uploadTask.snapshot.ref);
-        newImageUrls.push(downloadUrl);
+        const { data, error } = await supabase.storage.from('images').upload(fileName, file);
+        if (error) throw error;
+        
+        const { data: { publicUrl } } = supabase.storage.from('images').getPublicUrl(fileName);
+        newImageUrls.push(publicUrl);
+        setUploadProgress((i + 1) / files.length * 100);
       }
 
-      await setDoc(doc(db, 'modules', currentId), {
-        ...modules[currentId],
+      await supabase.from('modules').update({
         images: [...modules[currentId].images, ...newImageUrls]
-      });
+      }).eq('id', currentId);
     } catch (e) {
-      handleFirestoreError(e, OperationType.WRITE, `modules/${currentId}`);
+      handleSupabaseError(e, OperationType.WRITE, `modules/${currentId}`);
     } finally {
       setIsUploading(false);
       setUploadProgress(0);
@@ -453,17 +591,19 @@ function App() {
     const imageUrl = modules[currentId].images[indexToRemove];
     try {
       // Delete from Storage if it's a Firebase Storage URL
-      if (imageUrl.includes('firebasestorage.googleapis.com')) {
-        const imageRef = ref(storage, imageUrl);
-        await deleteObject(imageRef);
+      if (imageUrl.includes('supabase.co')) {
+        const pathMatches = imageUrl.match(/public\/images\/(.*)/);
+        if(pathMatches && pathMatches[1]) {
+          const filePath = pathMatches[1];
+          await supabase.storage.from('images').remove([filePath]);
+        }
       }
 
-      await setDoc(doc(db, 'modules', currentId), {
-        ...modules[currentId],
+      await supabase.from('modules').update({
         images: modules[currentId].images.filter((_, i) => i !== indexToRemove)
-      });
+      }).eq('id', currentId);
     } catch (e) {
-      handleFirestoreError(e, OperationType.WRITE, `modules/${currentId}`);
+      handleSupabaseError(e, OperationType.WRITE, `modules/${currentId}`);
     }
   };
 
@@ -520,6 +660,116 @@ function App() {
     );
   }
 
+  if (showMapView && modules.root) {
+    return (
+      <div className="h-screen bg-[#f8fafc] text-slate-900 flex flex-col font-sans overflow-hidden">
+        <header className="border-b border-slate-200 bg-white/90 backdrop-blur px-6 py-4 flex items-center justify-between shadow-sm z-10">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-blue-100 rounded-lg text-blue-600"><Network className="w-6 h-6" /></div>
+            <div>
+              <h1 className="text-xl font-bold">Workspace Map</h1>
+              <p className="text-xs text-slate-500 mt-0.5">Drag to pan, scroll to zoom. Click a node to enter the editor.</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+              <button onClick={() => setPanZoom(prev => ({ ...prev, scale: Math.min(prev.scale * 1.2, 3) }))} className="p-2 text-slate-500 hover:bg-slate-200 rounded-lg transition-colors" title="Zoom In"><ZoomIn className="w-5 h-5" /></button>
+              <button onClick={() => setPanZoom(prev => ({ ...prev, scale: Math.max(prev.scale * 0.8, 0.1) }))} className="p-2 text-slate-500 hover:bg-slate-200 rounded-lg transition-colors" title="Zoom Out"><ZoomOut className="w-5 h-5" /></button>
+              <button onClick={() => setPanZoom(prev => {
+                if (mapContainerRef.current) {
+                  const rect = mapContainerRef.current.getBoundingClientRect();
+                  const treeHeight = getSubtreeHeight('root', modules);
+                  return { x: Math.max(50, rect.width * 0.1), y: Math.max(50, rect.height / 2 - treeHeight / 2), scale: 1 };
+                }
+                return { x: 50, y: 50, scale: 1 };
+              })} className="p-2 text-slate-500 hover:bg-slate-200 rounded-lg mr-4 transition-colors" title="Reset View"><Maximize className="w-5 h-5" /></button>
+              <button
+              onClick={() => setShowMapView(false)}
+              className="px-5 py-2.5 rounded-xl bg-blue-600 text-white font-medium hover:bg-blue-700 transition-colors shadow-sm"
+              >
+                Open Editor View
+              </button>
+          </div>
+        </header>
+
+        <main 
+          ref={mapContainerRef}
+          className={`flex-1 relative overflow-hidden bg-slate-50 ${isDraggingMap ? 'cursor-grabbing' : 'cursor-grab'}`}
+          onPointerDown={handleMapPointerDown}
+          onPointerMove={handleMapPointerMove}
+          onPointerUp={handleMapPointerUp}
+          onPointerLeave={handleMapPointerUp}
+          onWheel={handleMapWheel}
+        >
+          {/* Background dots for aesthetics */}
+          <div className="absolute inset-0 pointer-events-none opacity-20" style={{ backgroundImage: 'radial-gradient(#cbd5e1 2px, transparent 2px)', backgroundSize: `${30 * panZoom.scale}px ${30 * panZoom.scale}px`, backgroundPosition: `${panZoom.x}px ${panZoom.y}px` }} />
+
+          <div 
+            className="absolute origin-top-left will-change-transform"
+            style={{ 
+              transform: `translate(${panZoom.x}px, ${panZoom.y}px) scale(${panZoom.scale})` 
+            }}
+          >
+            <svg className="absolute overflow-visible pointer-events-none">
+              {layoutEdges.map((edge, idx) => {
+                const fromIsDragged = dragNode?.id === edge.fromId;
+                const toIsDragged = dragNode?.id === edge.toId;
+
+                const startX = edge.fromX + (fromIsDragged ? dragNode.dx : 0);
+                const startY = edge.fromY + (fromIsDragged ? dragNode.dy : 0);
+                const endX = edge.toX + (toIsDragged ? dragNode.dx : 0);
+                const endY = edge.toY + (toIsDragged ? dragNode.dy : 0);
+
+                const cx1 = startX + (endX - startX) / 2;
+                const cy1 = startY;
+                const cx2 = cx1;
+                const cy2 = endY;
+
+                return (
+                  <path
+                    key={`edge-${idx}`}
+                    d={`M ${startX} ${startY} C ${cx1} ${cy1}, ${cx2} ${cy2}, ${endX} ${endY}`}
+                    strokeWidth="3.5"
+                    stroke={fromIsDragged || toIsDragged ? "#93c5fd" : "#cbd5e1"}
+                    fill="none"
+                    style={{ transition: dragNode ? 'none' : 'all 400ms cubic-bezier(0.34, 1.56, 0.64, 1)' }}
+                  />
+                );
+              })}
+            </svg>
+
+            {layoutNodes.map((node) => {
+              const colorClass = depthColors[node.depth % depthColors.length];
+              const isDragged = dragNode?.id === node.id;
+              const dx = isDragged ? dragNode.dx : 0;
+              const dy = isDragged ? dragNode.dy : 0;
+
+              return (
+                  <div
+                    key={node.id}
+                    className={`module-node absolute flex flex-col justify-center px-6 rounded-2xl border-2 shadow-lg cursor-pointer select-none ${colorClass} ${isDragged ? 'shadow-2xl ring-4 ring-white/50' : 'hover:shadow-xl'}`}
+                    style={{ 
+                      left: `${node.x}px`, 
+                      top: `${node.y}px`,
+                      width: `${NODE_WIDTH}px`, 
+                      height: `${NODE_HEIGHT}px`,
+                      zIndex: isDragged ? 50 : node.depth,
+                      transform: `translate(${dx}px, ${dy}px) scale(${isDragged ? 1.05 : 1})`,
+                      transition: dragNode ? 'none' : 'transform 400ms cubic-bezier(0.34, 1.56, 0.64, 1), box-shadow 200ms'
+                    }}
+                    onPointerDown={(e) => handleNodePointerDown(e, node.id)}
+                    onPointerMove={handleNodePointerMove}
+                    onPointerUp={(e) => handleNodePointerUp(e, node.id)}
+                  >
+                    <div className="font-bold text-[16px] truncate text-center">{node.title}</div>
+                  </div>
+              );
+            })}
+          </div>
+        </main>
+      </div>
+    );
+  }
+
   if (!currentModule) {
     return (
       <div className="p-8 text-center">
@@ -546,12 +796,13 @@ function App() {
       <div className="flex-1 flex flex-col h-full overflow-hidden relative">
         {/* Top Navigation Bar */}
         <header className="sticky top-0 z-10 bg-white/80 backdrop-blur-md border-b border-gray-200 px-4 py-3 sm:px-6 lg:px-8 flex-shrink-0">
-          <div className="max-w-5xl mx-auto flex items-center overflow-x-auto no-scrollbar">
+          <div className="max-w-5xl mx-auto flex items-center justify-between gap-4">
+            <div className="flex items-center overflow-x-auto no-scrollbar gap-1">
             {breadcrumbs.map((crumb, index) => (
               <React.Fragment key={crumb.id}>
                 <button
                   onClick={() => navigateTo(crumb.id)}
-                  className={`flex items-center whitespace-nowrap px-2 py-1 rounded-md transition-colors ${
+                  className={`flex items-center whitespace-nowrap px-2 py-1.5 rounded-md transition-colors ${
                     index === breadcrumbs.length - 1 
                       ? 'text-gray-900 font-medium bg-gray-100' 
                       : 'text-gray-500 hover:text-gray-900 hover:bg-gray-100'
@@ -565,6 +816,15 @@ function App() {
                 )}
               </React.Fragment>
             ))}
+            </div>
+
+            <button
+              onClick={() => setShowMapView(true)}
+              className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold text-slate-700 border border-slate-300 bg-white hover:bg-slate-50 transition-colors shadow-sm ml-4 whitespace-nowrap"
+            >
+              <Network className="w-4 h-4" />
+              Open Map View
+            </button>
           </div>
         </header>
 
