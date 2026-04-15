@@ -5,9 +5,10 @@
 
 import * as React from 'react';
 import { useState, useEffect, useRef, Component, ErrorInfo, ReactNode } from 'react';
-import { Folder, FileText, Image as ImageIcon, Plus, ChevronRight, ChevronDown, Home, Trash2, Edit2, X, AlertCircle, Maximize, ZoomIn, ZoomOut, Network } from 'lucide-react';
+import { Folder, FileText, Image as ImageIcon, Plus, ChevronRight, ChevronDown, Home, Trash2, Edit2, X, AlertCircle, Maximize, ZoomIn, ZoomOut, Network, Calendar, ChevronLeft, ChevronRight as ChevronRightIcon } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { supabase } from './supabase';
+import { format, addMonths, subMonths, startOfMonth, endOfMonth, startOfWeek, endOfWeek, isSameMonth, isSameDay, addDays } from 'date-fns';
 
 interface ErrorBoundaryProps {
   children: ReactNode;
@@ -70,7 +71,10 @@ type Module = {
   images: string[];
   parentId: string | null;
   children: string[];
+  calendarMarkerColor?: CalendarMarkerColor;
 };
+
+type CalendarMarkerColor = 'blue' | 'lightGreen' | 'green' | 'red' | 'orange' | 'yellow' | 'purple';
 
 enum OperationType {
   CREATE = 'create',
@@ -101,6 +105,84 @@ function handleSupabaseError(error: unknown, operationType: OperationType, path:
 
 const generateId = () => Math.random().toString(36).substring(2, 9);
 
+const CALENDAR_MARKER_STORAGE_KEY = 'calendar-marker-colors';
+const DEFAULT_CALENDAR_MARKER_COLOR: CalendarMarkerColor = 'blue';
+const CALENDAR_MARKER_OPTIONS: Array<{
+  value: CalendarMarkerColor;
+  label: string;
+  hex: string;
+  cellBackground: string;
+}> = [
+  { value: 'blue', label: 'Blue', hex: '#2563eb', cellBackground: '#eff6ff' },
+  { value: 'lightGreen', label: 'Light Green', hex: '#4ade80', cellBackground: '#f0fdf4' },
+  { value: 'green', label: 'Dark Green', hex: '#15803d', cellBackground: '#ecfdf5' },
+  { value: 'red', label: 'Red', hex: '#dc2626', cellBackground: '#fef2f2' },
+  { value: 'orange', label: 'Orange', hex: '#ea580c', cellBackground: '#fff7ed' },
+  { value: 'yellow', label: 'Yellow', hex: '#eab308', cellBackground: '#fefce8' },
+  { value: 'purple', label: 'Purple', hex: '#9333ea', cellBackground: '#faf5ff' },
+];
+
+const CALENDAR_MARKER_COLOR_MAP = Object.fromEntries(
+  CALENDAR_MARKER_OPTIONS.map(option => [option.value, option])
+) as Record<CalendarMarkerColor, (typeof CALENDAR_MARKER_OPTIONS)[number]>;
+
+const isCalendarModuleId = (id: string) => id.startsWith('cal_');
+
+const isCalendarMarkerColor = (value: unknown): value is CalendarMarkerColor =>
+  typeof value === 'string' && value in CALENDAR_MARKER_COLOR_MAP;
+
+const normalizeCalendarMarkerColor = (value: unknown): CalendarMarkerColor =>
+  isCalendarMarkerColor(value) ? value : DEFAULT_CALENDAR_MARKER_COLOR;
+
+const readStoredCalendarMarkerColors = (): Record<string, CalendarMarkerColor> => {
+  if (typeof window === 'undefined') return {};
+
+  try {
+    const rawValue = window.localStorage.getItem(CALENDAR_MARKER_STORAGE_KEY);
+    if (!rawValue) return {};
+
+    const parsed = JSON.parse(rawValue) as Record<string, unknown>;
+    return Object.fromEntries(
+      Object.entries(parsed).filter(([, color]) => isCalendarMarkerColor(color))
+    ) as Record<string, CalendarMarkerColor>;
+  } catch (error) {
+    console.warn('Failed to read calendar marker colors from localStorage.', error);
+    return {};
+  }
+};
+
+const getStoredCalendarMarkerColor = (id: string) => readStoredCalendarMarkerColors()[id];
+
+const storeCalendarMarkerColor = (id: string, color: CalendarMarkerColor) => {
+  if (typeof window === 'undefined') return;
+
+  try {
+    const storedColors = readStoredCalendarMarkerColors();
+    storedColors[id] = color;
+    window.localStorage.setItem(CALENDAR_MARKER_STORAGE_KEY, JSON.stringify(storedColors));
+  } catch (error) {
+    console.warn('Failed to persist calendar marker color locally.', error);
+  }
+};
+
+const hydrateModule = (row: any): Module => {
+  const storedMarkerColor = isCalendarModuleId(row.id) ? getStoredCalendarMarkerColor(row.id) : undefined;
+
+  return {
+    ...row,
+    images: Array.isArray(row.images) ? row.images : [],
+    children: Array.isArray(row.children) ? row.children : [],
+    calendarMarkerColor: isCalendarModuleId(row.id)
+      ? normalizeCalendarMarkerColor(row.calendarMarkerColor ?? storedMarkerColor)
+      : undefined,
+  } as Module;
+};
+
+const isMissingCalendarMarkerColumnError = (error: unknown) => {
+  const message = JSON.stringify(error).toLowerCase();
+  return message.includes('calendarmarkercolor') && (message.includes('column') || message.includes('schema cache'));
+};
+
 const initialModules: Record<string, Module> = {
   'root': {
     id: 'root',
@@ -113,17 +195,38 @@ const initialModules: Record<string, Module> = {
   }
 };
 
-const AutoResizeTextarea = ({ value, onChange, placeholder, className }: any) => {
+interface AutoResizeTextareaProps {
+  value: string;
+  onChange: (value: string) => void;
+  placeholder: string;
+  className: string;
+}
+
+const AutoResizeTextarea = ({ value, onChange, placeholder, className }: AutoResizeTextareaProps) => {
   const [localValue, setLocalValue] = useState(value);
   const ref = useRef<HTMLTextAreaElement>(null);
   const isComposingStr = useRef(false);
+  const isFocused = useRef(false);
+  const syncedValueRef = useRef(value);
+  const submittedValueRef = useRef<string | null>(null);
   
-  // Update local value when prop value changes, but only if it's different and we are not composing
   useEffect(() => {
-    if (!isComposingStr.current && value !== localValue) {
+    syncedValueRef.current = value;
+
+    if (submittedValueRef.current === value) {
+      submittedValueRef.current = null;
+    }
+
+    // While the textarea is being edited, prefer the local draft over remote echoes.
+    if (
+      !isComposingStr.current &&
+      !isFocused.current &&
+      submittedValueRef.current === null &&
+      value !== localValue
+    ) {
       setLocalValue(value);
     }
-  }, [value]);
+  }, [value, localValue]);
 
   useEffect(() => {
     if (ref.current) {
@@ -132,16 +235,31 @@ const AutoResizeTextarea = ({ value, onChange, placeholder, className }: any) =>
     }
   }, [localValue]);
 
-  // Debounced save to prevent rapid writes and input interruptions
+  const commitValue = (nextValue: string) => {
+    if (
+      nextValue === syncedValueRef.current ||
+      nextValue === submittedValueRef.current
+    ) {
+      return;
+    }
+
+    submittedValueRef.current = nextValue;
+    onChange(nextValue);
+  };
+
   useEffect(() => {
+    if (isComposingStr.current || localValue === value) {
+      return;
+    }
+
     const handler = setTimeout(() => {
-      if (localValue !== value) {
-        onChange({ target: { value: localValue } });
+      if (!isComposingStr.current) {
+        commitValue(localValue);
       }
-    }, 500); // 500ms delay
+    }, 500);
 
     return () => clearTimeout(handler);
-  }, [localValue]);
+  }, [localValue, value]);
 
   const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setLocalValue(e.target.value);
@@ -153,8 +271,6 @@ const AutoResizeTextarea = ({ value, onChange, placeholder, className }: any) =>
 
   const handleCompositionEnd = (e: React.CompositionEvent<HTMLTextAreaElement>) => {
     isComposingStr.current = false;
-    // Trigger an update after composition ends
-    // (e.target as HTMLTextAreaElement).value contains the final composed string
     setLocalValue((e.target as HTMLTextAreaElement).value);
   };
 
@@ -163,6 +279,13 @@ const AutoResizeTextarea = ({ value, onChange, placeholder, className }: any) =>
       ref={ref}
       value={localValue}
       onChange={handleChange}
+      onFocus={() => {
+        isFocused.current = true;
+      }}
+      onBlur={(e) => {
+        isFocused.current = false;
+        commitValue(e.target.value);
+      }}
       onCompositionStart={handleCompositionStart}
       onCompositionEnd={handleCompositionEnd}
       placeholder={placeholder}
@@ -190,14 +313,17 @@ function App() {
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [editTitleValue, setEditTitleValue] = useState('');
   const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set(['root']));
+  // View State
+  const [currentView, setCurrentView] = useState<'map' | 'editor' | 'calendar'>('map');
+  const [currentCalendarMonth, setCurrentCalendarMonth] = useState(new Date());
 
-  // Map View State
-  const [showMapView, setShowMapView] = useState(true);
+
   const [panZoom, setPanZoom] = useState({ x: 50, y: 50, scale: 1 });
   const [isDraggingMap, setIsDraggingMap] = useState(false);
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const [dragNode, setDragNode] = useState<{ id: string, dx: number, dy: number, startX: number, startY: number, hasDragged: boolean } | null>(null);
+  const calendarMarkerPersistenceMode = useRef<'unknown' | 'database' | 'local'>('unknown');
 
   // 1. Handle Authentication
   useEffect(() => {
@@ -238,7 +364,11 @@ function App() {
       const newModules: Record<string, Module> = {};
       if (data) {
         data.forEach((row: any) => {
-          newModules[row.id] = row as Module;
+          if (Object.prototype.hasOwnProperty.call(row, 'calendarMarkerColor')) {
+            calendarMarkerPersistenceMode.current = 'database';
+          }
+
+          newModules[row.id] = hydrateModule(row);
         });
       }
 
@@ -274,6 +404,10 @@ function App() {
   }, [isAuthReady]);
 
   const currentModule = modules[currentId];
+  const isCalendarModule = currentModule ? isCalendarModuleId(currentModule.id) : false;
+
+  const getCalendarMarkerColor = (module?: Module) =>
+    normalizeCalendarMarkerColor(module?.calendarMarkerColor);
 
   // Breadcrumbs
   const breadcrumbs = [];
@@ -340,7 +474,7 @@ function App() {
 
   // Adjust initial map position
   useEffect(() => {
-    if (showMapView && mapContainerRef.current && modules.root) {
+    if (currentView === 'map' && mapContainerRef.current && modules.root) {
       const rect = mapContainerRef.current.getBoundingClientRect();
       const treeHeight = getSubtreeHeight('root', modules);
       setPanZoom(prev => {
@@ -350,7 +484,7 @@ function App() {
         return prev;
       });
     }
-  }, [showMapView, Object.keys(modules).length]);
+  }, [currentView, Object.keys(modules).length]);
 
   const handleMapPointerDown = (e: React.PointerEvent) => {
     if ((e.target as HTMLElement).closest('.module-node') || (e.target as HTMLElement).closest('button')) return;
@@ -410,7 +544,7 @@ function App() {
     e.currentTarget.releasePointerCapture(e.pointerId);
     if (dragNode && !dragNode.hasDragged) {
       navigateTo(id);
-      setShowMapView(false);
+      setCurrentView('editor');
     }
     setDragNode(null);
   };
@@ -424,9 +558,44 @@ function App() {
     'bg-pink-600 text-white border-pink-700 hover:shadow-pink-500/30'
   ];
 
+  const navigateToCalendarDay = async (date: Date) => {
+    const id = `cal_${format(date, 'yyyy-MM-dd')}`;
+    if (!modules[id]) {
+      const newModuleBase = {
+        id,
+        title: format(date, 'yyyy-MM-dd'),
+        summary: '',
+        text: '',
+        images: [],
+        parentId: null,
+        children: [],
+      };
+      const newModule: Module = {
+        ...newModuleBase,
+        calendarMarkerColor: getStoredCalendarMarkerColor(id) ?? DEFAULT_CALENDAR_MARKER_COLOR,
+      };
+      // Optimistically update the state so navigation happens immediately
+      setModules(prev => ({...prev, [id]: newModule}));
+      setCurrentId(id);
+      setIsEditingTitle(false);
+      setCurrentView('editor');
+
+      try {
+        await supabase.from('modules').insert(newModuleBase);
+      } catch (e) {
+        console.error(e);
+      }
+    } else {
+      setCurrentId(id);
+      setIsEditingTitle(false);
+      setCurrentView('editor');
+    }
+  };
+
   const navigateTo = (id: string) => {
     setCurrentId(id);
     setIsEditingTitle(false);
+    setCurrentView('editor');
     
     // Auto-expand parents when navigating
     let parent = modules[id]?.parentId;
@@ -535,6 +704,47 @@ function App() {
     } catch (e) {
       handleSupabaseError(e, OperationType.WRITE, `modules/${currentId}`);      
     }
+  };
+
+  const updateCalendarMarkerColor = async (color: CalendarMarkerColor) => {
+    if (!isCalendarModuleId(currentId)) return;
+
+    setModules(prev => {
+      const current = prev[currentId];
+      if (!current) return prev;
+
+      return {
+        ...prev,
+        [currentId]: {
+          ...current,
+          calendarMarkerColor: color,
+        }
+      };
+    });
+
+    storeCalendarMarkerColor(currentId, color);
+
+    if (calendarMarkerPersistenceMode.current === 'local') {
+      return;
+    }
+
+    const { error } = await supabase
+      .from('modules')
+      .update({ calendarMarkerColor: color })
+      .eq('id', currentId);
+
+    if (!error) {
+      calendarMarkerPersistenceMode.current = 'database';
+      return;
+    }
+
+    if (isMissingCalendarMarkerColumnError(error)) {
+      calendarMarkerPersistenceMode.current = 'local';
+      console.warn('Supabase modules table does not have calendarMarkerColor yet. Falling back to localStorage.');
+      return;
+    }
+
+    handleSupabaseError(error, OperationType.WRITE, `modules/${currentId}`);
   };
 
   const handleTitleEditSave = async () => {
@@ -649,18 +859,123 @@ function App() {
     );
   };
 
-  if (isLoading) {
-    return (
-      <div className="h-screen flex items-center justify-center bg-gray-50">
-        <div className="flex flex-col items-center gap-4">
-          <div className="w-12 h-12 border-4 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
-          <p className="text-gray-500 font-medium">Connecting to workspace...</p>
+  const renderCalendar = () => {
+    const monthStart = startOfMonth(currentCalendarMonth);
+    const monthEnd = endOfMonth(monthStart);
+    const startDate = startOfWeek(monthStart);
+    const endDate = endOfWeek(monthEnd);
+
+    const dateFormat = "yyyy-MM-dd";
+    const rows = [];
+
+    let days = [];
+    let day = startDate;
+    let formattedDate = "";
+
+    while (day <= endDate) {
+      for (let i = 0; i < 7; i++) {
+        formattedDate = format(day, dateFormat);
+        const cloneDay = day;
+        const moduleId = `cal_${formattedDate}`;
+        const hasSchedule = modules[moduleId] && (modules[moduleId].text.trim() !== '' || modules[moduleId].summary.trim() !== '' || modules[moduleId].images.length > 0);
+        const moduleSummary = modules[moduleId]?.summary?.trim();
+        const markerColor = getCalendarMarkerColor(modules[moduleId]);
+        const markerColorMeta = CALENDAR_MARKER_COLOR_MAP[markerColor];
+        const isCurrentMonth = isSameMonth(day, monthStart);
+
+        days.push(
+          <div
+            key={day.toISOString()}
+            onClick={() => navigateToCalendarDay(cloneDay)}
+            className={`
+              flex-1 w-0 h-32 p-2 border-r border-b relative cursor-pointer transition-[background-color,filter] overflow-hidden hover:brightness-95
+              ${!isCurrentMonth ? 'text-slate-300 bg-slate-50/50' : 'text-slate-700 bg-white'}
+            `}
+            style={hasSchedule ? { backgroundColor: markerColorMeta.cellBackground } : undefined}
+          >
+             <span className={`text-sm font-semibold mb-1 ${isSameDay(day, new Date()) ? 'bg-blue-500 text-white w-7 h-7 rounded-full flex items-center justify-center' : 'block'}`}>
+                {format(day, 'd')}
+             </span>
+             {moduleSummary && (
+               <div className="text-xs text-slate-600 line-clamp-3 mt-1 leading-relaxed whitespace-pre-line break-words">
+                 {moduleSummary}
+               </div>
+             )}
+             {hasSchedule && (
+               <div
+                 className="absolute bottom-0 left-0 h-5 w-5 pointer-events-none"
+                 style={{
+                   backgroundColor: markerColorMeta.hex,
+                   clipPath: 'polygon(0 0, 0 100%, 100% 100%)',
+                 }}
+               />
+             )}
+          </div>
+        );
+        day = addDays(day, 1);
+      }
+      rows.push(
+        <div className="flex w-full" key={day.toISOString()}>
+          {days}
         </div>
+      );
+      days = [];
+    }
+
+    return (
+      <div className="h-screen bg-[#f8fafc] text-slate-900 flex flex-col font-sans overflow-hidden">
+        <header className="border-b border-slate-200 bg-white/90 backdrop-blur px-6 py-4 flex items-center justify-between shadow-sm z-10">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-indigo-100 rounded-lg text-indigo-600"><Calendar className="w-6 h-6" /></div>
+            <div>
+              <h1 className="text-xl font-bold">Calendar</h1>
+              <p className="text-xs text-slate-500 mt-0.5">Manage your daily schedule.</p>
+            </div>
+          </div>
+          
+          <div className="flex items-center gap-4">
+            <div className="flex items-center bg-slate-100 rounded-lg p-1">
+               <button onClick={() => setCurrentCalendarMonth(subMonths(currentCalendarMonth, 1))} className="p-1.5 hover:bg-white rounded-md text-slate-600 transition-colors"><ChevronLeft className="w-5 h-5" /></button>
+               <span className="px-4 font-semibold text-slate-700 w-32 text-center">{format(currentCalendarMonth, 'MMMM yyyy')}</span>
+               <button onClick={() => setCurrentCalendarMonth(addMonths(currentCalendarMonth, 1))} className="p-1.5 hover:bg-white rounded-md text-slate-600 transition-colors"><ChevronRightIcon className="w-5 h-5" /></button>
+            </div>
+
+            <button
+              onClick={() => setCurrentView('map')}
+              className="px-5 py-2.5 rounded-xl bg-blue-600 text-white font-medium hover:bg-blue-700 transition-colors shadow-sm"
+            >
+              Open Map View
+            </button>
+             <button
+              onClick={() => setCurrentView('editor')}
+              className="px-5 py-2.5 rounded-xl bg-slate-600 text-white font-medium hover:bg-slate-700 transition-colors shadow-sm"
+            >
+              Open Explorer
+            </button>
+          </div>
+        </header>
+
+        <main className="flex-1 overflow-y-auto p-8">
+           <div className="max-w-6xl mx-auto bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
+              <div className="flex bg-slate-50 border-b border-slate-200">
+                {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(day => (
+                  <div key={day} className="flex-1 py-3 text-center text-sm font-semibold text-slate-500 uppercase tracking-wider">
+                    {day}
+                  </div>
+                ))}
+              </div>
+              <div className="flex flex-col">
+                {rows}
+              </div>
+           </div>
+        </main>
       </div>
     );
-  }
+  };
 
-  if (showMapView && modules.root) {
+  if (currentView === 'calendar') return renderCalendar();
+
+  if (currentView === 'map' && modules.root) {
     return (
       <div className="h-screen bg-[#f8fafc] text-slate-900 flex flex-col font-sans overflow-hidden">
         <header className="border-b border-slate-200 bg-white/90 backdrop-blur px-6 py-4 flex items-center justify-between shadow-sm z-10">
@@ -683,10 +998,16 @@ function App() {
                 return { x: 50, y: 50, scale: 1 };
               })} className="p-2 text-slate-500 hover:bg-slate-200 rounded-lg mr-4 transition-colors" title="Reset View"><Maximize className="w-5 h-5" /></button>
               <button
-              onClick={() => setShowMapView(false)}
+              onClick={() => setCurrentView('editor')}
               className="px-5 py-2.5 rounded-xl bg-blue-600 text-white font-medium hover:bg-blue-700 transition-colors shadow-sm"
               >
                 Open Editor View
+              </button>
+              <button
+              onClick={() => setCurrentView('calendar')}
+              className="px-5 py-2.5 rounded-xl bg-indigo-600 text-white font-medium hover:bg-indigo-700 transition-colors shadow-sm ml-4"
+              >
+                Open Calendar
               </button>
           </div>
         </header>
@@ -819,11 +1140,18 @@ function App() {
             </div>
 
             <button
-              onClick={() => setShowMapView(true)}
+              onClick={() => setCurrentView('map')}
               className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold text-slate-700 border border-slate-300 bg-white hover:bg-slate-50 transition-colors shadow-sm ml-4 whitespace-nowrap"
             >
               <Network className="w-4 h-4" />
               Open Map View
+            </button>
+            <button
+              onClick={() => setCurrentView('calendar')}
+              className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold text-white border border-indigo-600 bg-indigo-600 hover:bg-indigo-700 transition-colors shadow-sm ml-4 whitespace-nowrap"
+            >
+              <Calendar className="w-4 h-4" />
+              Open Calendar
             </button>
           </div>
         </header>
@@ -866,12 +1194,50 @@ function App() {
                 </div>
 
                 {/* Summary Section */}
+                {isCalendarModule && (
+                  <div>
+                    <label className="block text-sm font-semibold text-gray-700 mb-3 uppercase tracking-wider">Marker Color</label>
+                    <div className="flex flex-wrap gap-3">
+                      {CALENDAR_MARKER_OPTIONS.map(option => {
+                        const isSelected = getCalendarMarkerColor(currentModule) === option.value;
+
+                        return (
+                          <button
+                            key={option.value}
+                            type="button"
+                            onClick={() => updateCalendarMarkerColor(option.value)}
+                            className={`flex items-center gap-3 rounded-xl border px-4 py-2.5 text-sm font-medium transition-all ${
+                              isSelected
+                                ? 'border-slate-900 bg-slate-900 text-white shadow-sm'
+                                : 'border-gray-200 bg-white text-gray-700 hover:border-slate-400 hover:bg-slate-50'
+                            }`}
+                          >
+                            <span className="relative block h-6 w-6 overflow-hidden rounded-md border border-black/10 bg-slate-50">
+                              <span
+                                className="absolute inset-0"
+                                style={{
+                                  backgroundColor: option.hex,
+                                  clipPath: 'polygon(0 0, 0 100%, 100% 100%)',
+                                }}
+                              />
+                            </span>
+                            {option.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <p className="mt-3 text-xs text-gray-500">
+                      The bottom-left triangle appears when the date has summary, text, or images.
+                    </p>
+                  </div>
+                )}
+
                 <div>
                   <label className="block text-sm font-semibold text-gray-700 mb-2 uppercase tracking-wider">Summary (简介)</label>
                   <AutoResizeTextarea
                     key={`summary-${currentId}`}
                     value={currentModule.summary}
-                    onChange={(e: any) => updateSummary(e.target.value)}
+                    onChange={updateSummary}
                     placeholder="Add a brief summary for this module..."
                     className="w-full resize-none bg-white border border-gray-200 rounded-xl p-4 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 text-gray-700 shadow-sm transition-all"
                   />
@@ -885,7 +1251,7 @@ function App() {
                       <AutoResizeTextarea
                         key={`text-${currentId}`}
                         value={currentModule.text}
-                        onChange={(e: any) => updateText(e.target.value)}
+                        onChange={updateText}
                         placeholder="Write your detailed content here..."
                         className="w-full min-h-[150px] resize-none bg-transparent focus:outline-none text-gray-700 text-lg leading-relaxed"
                       />
@@ -927,6 +1293,7 @@ function App() {
                 </div>
 
                 {/* Sub-modules Section */}
+                {!isCalendarModule && (
                 <section>
                   <div className="flex items-center justify-between mb-4">
                     <h2 className="text-sm font-semibold text-gray-700 uppercase tracking-wider flex items-center gap-2">
@@ -989,6 +1356,7 @@ function App() {
                     </button>
                   </div>
                 </section>
+                )}
 
               </motion.div>
             </AnimatePresence>
