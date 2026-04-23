@@ -75,6 +75,15 @@ type Module = {
 };
 
 type CalendarMarkerColor = 'blue' | 'lightGreen' | 'green' | 'red' | 'orange' | 'yellow' | 'purple';
+type TrainingIntensity = 'green' | 'blue' | 'yellow' | 'orange' | 'red' | 'purple';
+
+interface TrainingPlan {
+  id: string;
+  title: string;
+  details: string;
+  intensity: TrainingIntensity;
+  completed: boolean;
+}
 
 enum OperationType {
   CREATE = 'create',
@@ -103,7 +112,25 @@ function handleSupabaseError(error: unknown, operationType: OperationType, path:
   throw new Error(JSON.stringify(errInfo));
 }
 
+const getErrorMessage = (error: unknown) => {
+  if (error instanceof Error) return error.message;
+  if (typeof error === 'string') return error;
+
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return 'Unknown error';
+  }
+};
+
+const createSafeUploadFileName = (moduleId: string, fileName: string) => {
+  const extensionMatch = fileName.match(/\.([a-zA-Z0-9]+)$/);
+  const extension = extensionMatch ? extensionMatch[1].toLowerCase() : 'bin';
+  return `${moduleId}/${Date.now()}-upload.${extension}`;
+};
+
 const generateId = () => Math.random().toString(36).substring(2, 9);
+const TRAINING_PLANS_STORAGE_KEY = 'training-plans';
 
 const CALENDAR_MARKER_STORAGE_KEY = 'calendar-marker-colors';
 const DEFAULT_CALENDAR_MARKER_COLOR: CalendarMarkerColor = 'blue';
@@ -133,6 +160,131 @@ const isCalendarMarkerColor = (value: unknown): value is CalendarMarkerColor =>
 
 const normalizeCalendarMarkerColor = (value: unknown): CalendarMarkerColor =>
   isCalendarMarkerColor(value) ? value : DEFAULT_CALENDAR_MARKER_COLOR;
+
+const TRAINING_INTENSITY_STYLES: Record<TrainingIntensity, { block: string; accent: string; badge: string }> = {
+  green: {
+    block: 'bg-emerald-50 text-emerald-700',
+    accent: 'bg-emerald-500',
+    badge: 'text-emerald-600',
+  },
+  blue: {
+    block: 'bg-sky-50 text-sky-700',
+    accent: 'bg-sky-500',
+    badge: 'text-sky-600',
+  },
+  yellow: {
+    block: 'bg-amber-50 text-amber-700',
+    accent: 'bg-amber-400',
+    badge: 'text-amber-600',
+  },
+  orange: {
+    block: 'bg-orange-50 text-orange-700',
+    accent: 'bg-orange-500',
+    badge: 'text-orange-600',
+  },
+  red: {
+    block: 'bg-rose-50 text-rose-700',
+    accent: 'bg-rose-500',
+    badge: 'text-rose-600',
+  },
+  purple: {
+    block: 'bg-violet-50 text-violet-700',
+    accent: 'bg-violet-500',
+    badge: 'text-violet-600',
+  },
+};
+
+const readStoredTrainingPlans = (): Record<string, TrainingPlan[]> => {
+  if (typeof window === 'undefined') return {};
+
+  try {
+    const rawValue = window.localStorage.getItem(TRAINING_PLANS_STORAGE_KEY);
+    if (!rawValue) return {};
+
+    const parsed = JSON.parse(rawValue) as Record<string, unknown>;
+    return Object.fromEntries(
+      Object.entries(parsed).map(([dateKey, value]) => [
+        dateKey,
+        Array.isArray(value)
+          ? value.filter((plan): plan is TrainingPlan => {
+              if (!plan || typeof plan !== 'object') return false;
+
+              return (
+                typeof (plan as TrainingPlan).id === 'string' &&
+                typeof (plan as TrainingPlan).title === 'string' &&
+                typeof (plan as TrainingPlan).details === 'string' &&
+                typeof (plan as TrainingPlan).completed === 'boolean' &&
+                ['green', 'blue', 'yellow', 'orange', 'red', 'purple'].includes((plan as TrainingPlan).intensity)
+              );
+            })
+          : [],
+      ])
+    );
+  } catch (error) {
+    console.warn('Failed to read training plans from localStorage.', error);
+    return {};
+  }
+};
+
+const writeStoredTrainingPlans = (plans: Record<string, TrainingPlan[]>) => {
+  if (typeof window === 'undefined') return;
+
+  try {
+    window.localStorage.setItem(TRAINING_PLANS_STORAGE_KEY, JSON.stringify(plans));
+  } catch (error) {
+    console.warn('Failed to persist training plans locally.', error);
+  }
+};
+
+const createDefaultTrainingPlans = (baseDate: Date): Record<string, TrainingPlan[]> => {
+  const currentMonthStart = startOfMonth(baseDate);
+
+  return {
+    [format(addDays(currentMonthStart, 1), 'yyyy-MM-dd')]: [
+      {
+        id: generateId(),
+        title: 'Easy Run · 8 km · 5:45/km',
+        details: '保持轻松心率，最后 1 km 放松慢跑。',
+        intensity: 'green',
+        completed: false,
+      },
+    ],
+    [format(addDays(currentMonthStart, 4), 'yyyy-MM-dd')]: [
+      {
+        id: generateId(),
+        title: 'Interval · 10 km · 4:10/km',
+        details: '2 km 热身，6 x 800m，间歇慢跑恢复。',
+        intensity: 'red',
+        completed: false,
+      },
+    ],
+    [format(addDays(currentMonthStart, 9), 'yyyy-MM-dd')]: [
+      {
+        id: generateId(),
+        title: 'Tempo · 12 km · 4:40/km',
+        details: '前后各 3 km 轻松，中间 6 km 节奏跑。',
+        intensity: 'orange',
+        completed: true,
+      },
+      {
+        id: generateId(),
+        title: 'Easy Run · 5 km · 6:00/km',
+        details: '晚间恢复跑，跑后拉伸 10 分钟。',
+        intensity: 'green',
+        completed: false,
+      },
+    ],
+    [format(addDays(currentMonthStart, 15), 'yyyy-MM-dd')]: [
+      {
+        id: generateId(),
+        title: 'Long Run · 24 km · 5:20/km',
+        details: '补给按比赛日模拟，每 40 分钟一次。',
+        intensity: 'blue',
+        completed: false,
+      },
+    ],
+  };
+};
 
 const readStoredCalendarMarkerColors = (): Record<string, CalendarMarkerColor> => {
   if (typeof window === 'undefined') return {};
@@ -309,6 +461,7 @@ function App() {
   const [isLoading, setIsLoading] = useState(true);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadErrorMessage, setUploadErrorMessage] = useState<string | null>(null);
   const [currentId, setCurrentId] = useState<string>('root');
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [editTitleValue, setEditTitleValue] = useState('');
@@ -316,6 +469,8 @@ function App() {
   // View State
   const [currentView, setCurrentView] = useState<'map' | 'editor' | 'calendar'>('map');
   const [currentCalendarMonth, setCurrentCalendarMonth] = useState(new Date());
+  const [trainingPlans, setTrainingPlans] = useState<Record<string, TrainingPlan[]>>({});
+  const [selectedCalendarDate, setSelectedCalendarDate] = useState<Date | null>(null);
 
 
   const [panZoom, setPanZoom] = useState({ x: 50, y: 50, scale: 1 });
@@ -349,6 +504,36 @@ function App() {
     }
     testConnection();
   }, [isAuthReady]);
+
+  useEffect(() => {
+    const storedPlans = readStoredTrainingPlans();
+
+    if (Object.keys(storedPlans).length > 0) {
+      setTrainingPlans(storedPlans);
+      return;
+    }
+
+    const seedPlans = createDefaultTrainingPlans(new Date());
+    setTrainingPlans(seedPlans);
+    writeStoredTrainingPlans(seedPlans);
+  }, []);
+
+  useEffect(() => {
+    if (!selectedCalendarDate) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        closeCalendarDateModal();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [selectedCalendarDate]);
+
+  useEffect(() => {
+    setUploadErrorMessage(null);
+  }, [currentId]);
 
   // 3. Real-time Sync
   useEffect(() => {
@@ -706,6 +891,78 @@ function App() {
     }
   };
 
+  const closeCalendarDateModal = () => {
+    setSelectedCalendarDate(null);
+  };
+
+  const toggleTrainingPlanCompletion = (dateKey: string, planId: string) => {
+    const nextPlans = {
+      ...trainingPlans,
+      [dateKey]: (trainingPlans[dateKey] ?? []).map(plan =>
+        plan.id === planId ? { ...plan, completed: !plan.completed } : plan
+      ),
+    };
+
+    setTrainingPlans(nextPlans);
+    writeStoredTrainingPlans(nextPlans);
+  };
+
+  const updateTrainingPlan = (
+    dateKey: string,
+    planId: string,
+    field: 'title' | 'details' | 'intensity',
+    value: string
+  ) => {
+    const nextPlans = {
+      ...trainingPlans,
+      [dateKey]: (trainingPlans[dateKey] ?? []).map(plan =>
+        plan.id === planId
+          ? {
+              ...plan,
+              [field]: value,
+            }
+          : plan
+      ),
+    };
+
+    setTrainingPlans(nextPlans);
+    writeStoredTrainingPlans(nextPlans);
+  };
+
+  const addTrainingPlan = (dateKey: string) => {
+    const nextPlans = {
+      ...trainingPlans,
+      [dateKey]: [
+        ...(trainingPlans[dateKey] ?? []),
+        {
+          id: generateId(),
+          title: 'New Training',
+          details: '',
+          intensity: 'green' as TrainingIntensity,
+          completed: false,
+        },
+      ],
+    };
+
+    setTrainingPlans(nextPlans);
+    writeStoredTrainingPlans(nextPlans);
+  };
+
+  const deleteTrainingPlan = (dateKey: string, planId: string) => {
+    const nextDayPlans = (trainingPlans[dateKey] ?? []).filter(plan => plan.id !== planId);
+    const nextPlans = {
+      ...trainingPlans,
+      [dateKey]: nextDayPlans,
+    };
+
+    setTrainingPlans(nextPlans);
+    writeStoredTrainingPlans(nextPlans);
+  };
+
+  const openCalendarDateSidebar = (date: Date) => {
+    setSelectedCalendarDate(date);
+  };
+
   const updateCalendarMarkerColor = async (color: CalendarMarkerColor) => {
     if (!isCalendarModuleId(currentId)) return;
 
@@ -762,6 +1019,7 @@ function App() {
     const files = e.target.files;
     if (!files || files.length === 0) return;
 
+    setUploadErrorMessage(null);
     setIsUploading(true);
     setUploadProgress(0);
     const newImageUrls: string[] = [];
@@ -775,7 +1033,7 @@ function App() {
           throw new Error(`File ${file.name} is too large (max 10MB)`);
         }
 
-        const fileName = `${currentId}/${Date.now()}-${file.name}`;
+        const fileName = createSafeUploadFileName(currentId, file.name);
 
         const { data, error } = await supabase.storage.from('images').upload(fileName, file);
         if (error) throw error;
@@ -789,7 +1047,9 @@ function App() {
         images: [...modules[currentId].images, ...newImageUrls]
       }).eq('id', currentId);
     } catch (e) {
-      handleSupabaseError(e, OperationType.WRITE, `modules/${currentId}`);
+      const errorMessage = getErrorMessage(e);
+      console.error('Image upload failed:', errorMessage, e);
+      setUploadErrorMessage(`上传失败：${errorMessage}`);
     } finally {
       setIsUploading(false);
       setUploadProgress(0);
@@ -864,6 +1124,8 @@ function App() {
     const monthEnd = endOfMonth(monthStart);
     const startDate = startOfWeek(monthStart);
     const endDate = endOfWeek(monthEnd);
+    const selectedDateKey = selectedCalendarDate ? format(selectedCalendarDate, 'yyyy-MM-dd') : null;
+    const selectedDatePlans = selectedDateKey ? trainingPlans[selectedDateKey] ?? [] : [];
 
     const dateFormat = "yyyy-MM-dd";
     const rows = [];
@@ -876,99 +1138,267 @@ function App() {
       for (let i = 0; i < 7; i++) {
         formattedDate = format(day, dateFormat);
         const cloneDay = day;
-        const moduleId = `cal_${formattedDate}`;
-        const hasSchedule = modules[moduleId] && (modules[moduleId].text.trim() !== '' || modules[moduleId].summary.trim() !== '' || modules[moduleId].images.length > 0);
-        const moduleSummary = modules[moduleId]?.summary?.trim();
-        const markerColor = getCalendarMarkerColor(modules[moduleId]);
-        const markerColorMeta = CALENDAR_MARKER_COLOR_MAP[markerColor];
         const isCurrentMonth = isSameMonth(day, monthStart);
+        const dayPlans = trainingPlans[formattedDate] ?? [];
+        const visiblePlans = dayPlans.slice(0, 2);
+        const hiddenPlanCount = Math.max(dayPlans.length - visiblePlans.length, 0);
+        const isToday = isSameDay(day, new Date());
+        const isSelectedDate = selectedCalendarDate ? isSameDay(day, selectedCalendarDate) : false;
+        const completedPlans = dayPlans.filter(plan => plan.completed).length;
+        const hasTraining = dayPlans.length > 0;
 
         days.push(
           <div
             key={day.toISOString()}
-            onClick={() => navigateToCalendarDay(cloneDay)}
+            onClick={() => openCalendarDateSidebar(cloneDay)}
             className={`
-              flex-1 w-0 h-32 p-2 border-r border-b relative cursor-pointer transition-[background-color,filter] overflow-hidden hover:brightness-95
-              ${!isCurrentMonth ? 'text-slate-300 bg-slate-50/50' : 'text-slate-700 bg-white'}
+              min-h-[120px] cursor-pointer border border-slate-200/80 px-3 py-3 transition-colors
+              ${isCurrentMonth ? 'bg-white' : 'bg-slate-50/70 text-slate-400'}
+              ${hasTraining && isCurrentMonth ? 'bg-sky-50/40' : ''}
+              ${isSelectedDate ? 'relative z-10 border-blue-500 ring-1 ring-blue-500' : ''}
             `}
-            style={hasSchedule ? { backgroundColor: markerColorMeta.cellBackground } : undefined}
           >
-             <span className={`text-sm font-semibold mb-1 ${isSameDay(day, new Date()) ? 'bg-blue-500 text-white w-7 h-7 rounded-full flex items-center justify-center' : 'block'}`}>
-                {format(day, 'd')}
-             </span>
-             {moduleSummary && (
-               <div className="text-xs text-slate-600 line-clamp-3 mt-1 leading-relaxed whitespace-pre-line break-words">
-                 {moduleSummary}
-               </div>
-             )}
-             {hasSchedule && (
-               <div
-                 className="absolute bottom-0 left-0 h-5 w-5 pointer-events-none"
-                 style={{
-                   backgroundColor: markerColorMeta.hex,
-                   clipPath: 'polygon(0 0, 0 100%, 100% 100%)',
-                 }}
-               />
-             )}
+            <div className="flex h-full flex-col">
+              <div className="mb-3 flex items-start justify-between">
+                <span className="text-[11px] font-medium text-slate-400">
+                  {hasTraining && isCurrentMonth ? `${completedPlans}/${dayPlans.length} 完成` : '\u00A0'}
+                </span>
+                <span className={`text-xs ${isToday ? 'font-bold text-red-500' : 'font-medium text-slate-400'}`}>
+                  {format(day, 'd')}
+                </span>
+              </div>
+
+              <div className="flex flex-1 flex-col gap-1.5">
+                {visiblePlans.map(plan => {
+                  const style = TRAINING_INTENSITY_STYLES[plan.intensity];
+
+                  return (
+                  <div
+                    key={plan.id}
+                    className={`rounded-md px-2 py-1.5 text-[11px] leading-tight ${style.block} ${plan.completed ? 'opacity-60 line-through' : ''}`}
+                  >
+                    <div className="flex items-center gap-1.5">
+                      <span className={`h-1.5 w-1.5 rounded-full ${style.accent}`} />
+                      <span className="truncate font-medium">{plan.title || 'Untitled'}</span>
+                    </div>
+                  </div>
+                  );
+                })}
+
+                {hiddenPlanCount > 0 && (
+                  <div className="text-[11px] font-medium text-slate-500">
+                    +{hiddenPlanCount} more
+                  </div>
+                )}
+
+                {dayPlans.length === 0 && isCurrentMonth && (
+                  <div className="mt-auto text-[11px] text-slate-300">Rest day</div>
+                )}
+              </div>
+            </div>
           </div>
         );
         day = addDays(day, 1);
       }
       rows.push(
-        <div className="flex w-full" key={day.toISOString()}>
+        <React.Fragment key={day.toISOString()}>
           {days}
-        </div>
+        </React.Fragment>
       );
       days = [];
     }
 
     return (
-      <div className="h-screen bg-[#f8fafc] text-slate-900 flex flex-col font-sans overflow-hidden">
-        <header className="border-b border-slate-200 bg-white/90 backdrop-blur px-6 py-4 flex items-center justify-between shadow-sm z-10">
-          <div className="flex items-center gap-3">
-            <div className="p-2 bg-indigo-100 rounded-lg text-indigo-600"><Calendar className="w-6 h-6" /></div>
-            <div>
-              <h1 className="text-xl font-bold">Calendar</h1>
-              <p className="text-xs text-slate-500 mt-0.5">Manage your daily schedule.</p>
-            </div>
-          </div>
-          
-          <div className="flex items-center gap-4">
-            <div className="flex items-center bg-slate-100 rounded-lg p-1">
-               <button onClick={() => setCurrentCalendarMonth(subMonths(currentCalendarMonth, 1))} className="p-1.5 hover:bg-white rounded-md text-slate-600 transition-colors"><ChevronLeft className="w-5 h-5" /></button>
-               <span className="px-4 font-semibold text-slate-700 w-32 text-center">{format(currentCalendarMonth, 'MMMM yyyy')}</span>
-               <button onClick={() => setCurrentCalendarMonth(addMonths(currentCalendarMonth, 1))} className="p-1.5 hover:bg-white rounded-md text-slate-600 transition-colors"><ChevronRightIcon className="w-5 h-5" /></button>
+      <div className="flex h-screen overflow-hidden bg-[#fcfcfb] text-slate-900 font-sans">
+        <div className="flex min-w-0 flex-1 flex-col">
+        <header className="border-b border-slate-200 bg-[#fcfcfb] px-4 py-4 sm:px-6">
+          <div className="mx-auto flex max-w-7xl flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+            <div className="flex items-center gap-3">
+              <div className="rounded-lg bg-slate-100 p-2 text-slate-600">
+                <Calendar className="h-5 w-5" />
+              </div>
+              <div>
+                <h1 className="text-2xl font-semibold tracking-tight">Running Planner</h1>
+                <p className="text-sm text-slate-500">月度训练安排，专注配速、距离和执行状态。</p>
+              </div>
             </div>
 
-            <button
-              onClick={() => setCurrentView('map')}
-              className="px-5 py-2.5 rounded-xl bg-blue-600 text-white font-medium hover:bg-blue-700 transition-colors shadow-sm"
-            >
-              Open Map View
-            </button>
-             <button
-              onClick={() => setCurrentView('editor')}
-              className="px-5 py-2.5 rounded-xl bg-slate-600 text-white font-medium hover:bg-slate-700 transition-colors shadow-sm"
-            >
-              Open Explorer
-            </button>
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="flex items-center rounded-lg border border-slate-200 bg-white">
+                <button onClick={() => setCurrentCalendarMonth(subMonths(currentCalendarMonth, 1))} className="p-2 text-slate-500 transition-colors hover:bg-slate-50 hover:text-slate-800"><ChevronLeft className="h-4 w-4" /></button>
+                <span className="min-w-36 px-3 text-center text-sm font-medium text-slate-700 sm:min-w-40">{format(currentCalendarMonth, 'MMMM yyyy')}</span>
+                <button onClick={() => setCurrentCalendarMonth(addMonths(currentCalendarMonth, 1))} className="p-2 text-slate-500 transition-colors hover:bg-slate-50 hover:text-slate-800"><ChevronRightIcon className="h-4 w-4" /></button>
+              </div>
+
+              <button
+                onClick={() => setCurrentView('map')}
+                className="rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-700 transition-colors hover:bg-slate-50"
+              >
+                打开 Map
+              </button>
+
+              <button
+                onClick={() => setCurrentView('editor')}
+                className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-slate-800"
+              >
+                打开 Explorer
+              </button>
+            </div>
           </div>
         </header>
 
-        <main className="flex-1 overflow-y-auto p-8">
-           <div className="max-w-6xl mx-auto bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
-              <div className="flex bg-slate-50 border-b border-slate-200">
+        <main className="flex-1 overflow-y-auto px-4 py-5 sm:px-6">
+           <div className="mx-auto flex max-w-7xl flex-col">
+              <div className="border border-slate-200 bg-white">
+                <div className="grid grid-cols-7 border-b border-slate-200">
                 {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(day => (
-                  <div key={day} className="flex-1 py-3 text-center text-sm font-semibold text-slate-500 uppercase tracking-wider">
+                  <div key={day} className="border-r border-slate-200 px-3 py-2 text-left text-[11px] font-medium uppercase tracking-[0.14em] text-slate-400 last:border-r-0 sm:text-xs">
                     {day}
                   </div>
                 ))}
-              </div>
-              <div className="flex flex-col">
+                </div>
+
+                <div className="grid grid-cols-7">
                 {rows}
+                </div>
               </div>
            </div>
         </main>
+        </div>
+
+        {selectedCalendarDate && (
+          <aside className="w-full max-w-md border-l border-slate-200 bg-white px-5 py-5">
+            <div className="flex h-full flex-col">
+              <div className="flex items-start justify-between gap-4 border-b border-slate-200 pb-4">
+                <div>
+                  <p className="text-xs font-medium uppercase tracking-[0.14em] text-slate-400">
+                    {format(selectedCalendarDate, 'EEEE')}
+                  </p>
+                  <h2 className="mt-1 text-xl font-semibold text-slate-900">
+                    {format(selectedCalendarDate, 'MMMM d, yyyy')}
+                  </h2>
+                  <p className="mt-2 text-sm text-slate-500">
+                    {selectedDatePlans.length > 0 ? `共 ${selectedDatePlans.length} 个训练安排` : '当天没有训练安排'}
+                  </p>
+                </div>
+                <button
+                  onClick={closeCalendarDateModal}
+                  className="rounded-md p-2 text-slate-400 transition-colors hover:bg-slate-50 hover:text-slate-700"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+
+              <div className="flex items-center justify-between border-b border-slate-200 py-3">
+                <p className="text-sm text-slate-500">标题会显示在日历上，具体内容只显示在侧边栏。</p>
+                <button
+                  type="button"
+                  onClick={() => selectedDateKey && addTrainingPlan(selectedDateKey)}
+                  className="rounded-md border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-700 transition-colors hover:bg-slate-50"
+                >
+                  新增事项
+                </button>
+              </div>
+
+              <div className="flex-1 space-y-3 overflow-y-auto py-5">
+                {selectedDatePlans.length === 0 && (
+                  <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-6 text-sm text-slate-500">
+                    今天是休息日，可以安排拉伸、泡沫轴或完全恢复。
+                  </div>
+                )}
+
+                {selectedDatePlans.map(plan => {
+                  const style = TRAINING_INTENSITY_STYLES[plan.intensity];
+
+                  return (
+                    <section key={plan.id} className="border border-slate-200 p-4">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-2">
+                          <span className={`h-2 w-2 rounded-full ${style.accent}`} />
+                          <span className={`text-xs font-medium ${style.badge}`}>强度</span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => toggleTrainingPlanCompletion(selectedDateKey!, plan.id)}
+                          className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+                            plan.completed
+                              ? 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
+                              : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                          }`}
+                        >
+                          {plan.completed ? '已完成' : '未完成'}
+                        </button>
+                      </div>
+
+                      <div className="mt-4">
+                        <label className="mb-1.5 block text-xs font-medium uppercase tracking-[0.12em] text-slate-400">
+                          标题
+                        </label>
+                        <input
+                          type="text"
+                          value={plan.title}
+                          onChange={(e) => updateTrainingPlan(selectedDateKey!, plan.id, 'title', e.target.value)}
+                          placeholder="例如：Easy Run · 8 km · 5:45/km"
+                          className="w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-800 outline-none transition focus:border-slate-400"
+                        />
+                      </div>
+
+                      <div className="mt-4">
+                        <label className="mb-1.5 block text-xs font-medium uppercase tracking-[0.12em] text-slate-400">
+                          具体内容
+                        </label>
+                        <textarea
+                          value={plan.details}
+                          onChange={(e) => updateTrainingPlan(selectedDateKey!, plan.id, 'details', e.target.value)}
+                          placeholder="这里只出现在右侧栏，例如训练说明、补给计划、恢复要求等"
+                          className="min-h-[110px] w-full rounded-md border border-slate-200 px-3 py-2 text-sm leading-6 text-slate-700 outline-none transition focus:border-slate-400"
+                        />
+                      </div>
+
+                      <div className="mt-4">
+                        <label className="mb-1.5 block text-xs font-medium uppercase tracking-[0.12em] text-slate-400">
+                          强度颜色
+                        </label>
+                        <div className="flex flex-wrap gap-2">
+                          {(['green', 'blue', 'yellow', 'orange', 'red', 'purple'] as TrainingIntensity[]).map(intensity => {
+                            const intensityStyle = TRAINING_INTENSITY_STYLES[intensity];
+                            const isActive = plan.intensity === intensity;
+
+                            return (
+                              <button
+                                key={intensity}
+                                type="button"
+                                onClick={() => updateTrainingPlan(selectedDateKey!, plan.id, 'intensity', intensity)}
+                                className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+                                  isActive
+                                    ? `${intensityStyle.block} ring-1 ring-slate-300`
+                                    : 'border border-slate-200 text-slate-500 hover:bg-slate-50'
+                                }`}
+                              >
+                                {intensity}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      <div className="mt-4 flex justify-end">
+                        <button
+                          type="button"
+                          onClick={() => deleteTrainingPlan(selectedDateKey!, plan.id)}
+                          className="rounded-md px-3 py-2 text-sm font-medium text-rose-600 transition-colors hover:bg-rose-50"
+                        >
+                          删除事项
+                        </button>
+                      </div>
+                    </section>
+                  );
+                })}
+              </div>
+
+            </div>
+          </aside>
+        )}
       </div>
     );
   };
@@ -1300,6 +1730,11 @@ function App() {
                         <input type="file" accept="image/*" multiple className="hidden" onChange={handleImageUpload} disabled={isUploading} />
                       </label>
                     </div>
+                    {uploadErrorMessage && (
+                      <div className="border-t border-red-100 bg-red-50 px-6 py-3 text-sm text-red-700">
+                        {uploadErrorMessage}
+                      </div>
+                    )}
                   </section>
                 </div>
 
