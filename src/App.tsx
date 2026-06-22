@@ -8,7 +8,23 @@ import { useState, useEffect, useRef, Component, ErrorInfo, ReactNode } from 're
 import { Folder, FileText, Image as ImageIcon, Plus, ChevronRight, ChevronDown, Home, Trash2, Edit2, X, AlertCircle, Maximize, ZoomIn, ZoomOut, Network, Calendar, ChevronLeft, ChevronRight as ChevronRightIcon } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { supabase } from './supabase';
-import { format, addMonths, subMonths, startOfMonth, endOfMonth, startOfWeek, endOfWeek, isSameMonth, isSameDay, addDays } from 'date-fns';
+import {
+  format,
+  addMonths,
+  subMonths,
+  addWeeks,
+  subWeeks,
+  addYears,
+  subYears,
+  startOfMonth,
+  endOfMonth,
+  startOfWeek,
+  endOfWeek,
+  isSameMonth,
+  isSameDay,
+  isSameWeek,
+  addDays,
+} from 'date-fns';
 
 interface ErrorBoundaryProps {
   children: ReactNode;
@@ -76,6 +92,7 @@ type Module = {
 
 type CalendarMarkerColor = 'blue' | 'lightGreen' | 'green' | 'red' | 'orange' | 'yellow' | 'purple';
 type TrainingIntensity = 'green' | 'blue' | 'yellow' | 'orange' | 'red' | 'purple';
+type CalendarMode = 'year' | 'week' | 'month';
 
 interface TrainingPlan {
   id: string;
@@ -83,6 +100,8 @@ interface TrainingPlan {
   details: string;
   intensity: TrainingIntensity;
   completed: boolean;
+  startTime: string;
+  durationMinutes: number;
 }
 
 enum OperationType {
@@ -161,37 +180,150 @@ const isCalendarMarkerColor = (value: unknown): value is CalendarMarkerColor =>
 const normalizeCalendarMarkerColor = (value: unknown): CalendarMarkerColor =>
   isCalendarMarkerColor(value) ? value : DEFAULT_CALENDAR_MARKER_COLOR;
 
-const TRAINING_INTENSITY_STYLES: Record<TrainingIntensity, { block: string; accent: string; badge: string }> = {
+const TRAINING_INTENSITY_STYLES: Record<TrainingIntensity, { block: string; accent: string; border: string; pill: string }> = {
   green: {
     block: 'bg-emerald-50 text-emerald-700',
     accent: 'bg-emerald-500',
-    badge: 'text-emerald-600',
+    border: 'border-emerald-400',
+    pill: 'bg-emerald-500 text-white',
   },
   blue: {
     block: 'bg-sky-50 text-sky-700',
     accent: 'bg-sky-500',
-    badge: 'text-sky-600',
+    border: 'border-sky-400',
+    pill: 'bg-sky-500 text-white',
   },
   yellow: {
     block: 'bg-amber-50 text-amber-700',
     accent: 'bg-amber-400',
-    badge: 'text-amber-600',
+    border: 'border-amber-400',
+    pill: 'bg-amber-400 text-white',
   },
   orange: {
     block: 'bg-orange-50 text-orange-700',
     accent: 'bg-orange-500',
-    badge: 'text-orange-600',
+    border: 'border-orange-400',
+    pill: 'bg-orange-500 text-white',
   },
   red: {
     block: 'bg-rose-50 text-rose-700',
     accent: 'bg-rose-500',
-    badge: 'text-rose-600',
+    border: 'border-rose-400',
+    pill: 'bg-rose-500 text-white',
   },
   purple: {
     block: 'bg-violet-50 text-violet-700',
     accent: 'bg-violet-500',
-    badge: 'text-violet-600',
+    border: 'border-violet-400',
+    pill: 'bg-violet-500 text-white',
   },
+};
+
+const WEEK_START_HOUR = 6;
+const WEEK_END_HOUR = 22;
+const WEEK_HOUR_HEIGHT = 72;
+const DEFAULT_TRAINING_START_TIME = '07:00';
+const DEFAULT_TRAINING_DURATION = 60;
+const TRAINING_INTENSITIES: TrainingIntensity[] = ['green', 'blue', 'yellow', 'orange', 'red', 'purple'];
+
+const isTrainingIntensity = (value: unknown): value is TrainingIntensity =>
+  typeof value === 'string' && TRAINING_INTENSITIES.includes(value as TrainingIntensity);
+
+const timeToMinutes = (value: string) => {
+  const match = /^(\d{2}):(\d{2})$/.exec(value);
+  if (!match) return WEEK_START_HOUR * 60;
+
+  return Number(match[1]) * 60 + Number(match[2]);
+};
+
+const minutesToTime = (value: number) => {
+  const clamped = Math.min(Math.max(value, WEEK_START_HOUR * 60), WEEK_END_HOUR * 60 - 15);
+  return `${String(Math.floor(clamped / 60)).padStart(2, '0')}:${String(clamped % 60).padStart(2, '0')}`;
+};
+
+const normalizeTrainingTime = (startTime: unknown, durationMinutes: unknown) => {
+  const rawStart = typeof startTime === 'string' ? timeToMinutes(startTime) : timeToMinutes(DEFAULT_TRAINING_START_TIME);
+  const roundedStart = Math.round(rawStart / 15) * 15;
+  const start = Math.min(Math.max(roundedStart, WEEK_START_HOUR * 60), WEEK_END_HOUR * 60 - 15);
+  const rawDuration = typeof durationMinutes === 'number' && Number.isFinite(durationMinutes)
+    ? durationMinutes
+    : DEFAULT_TRAINING_DURATION;
+  const roundedDuration = Math.max(15, Math.round(rawDuration / 15) * 15);
+  const duration = Math.min(roundedDuration, WEEK_END_HOUR * 60 - start);
+
+  return { startTime: minutesToTime(start), durationMinutes: duration };
+};
+
+const normalizeStoredTrainingPlan = (value: unknown): TrainingPlan | null => {
+  if (!value || typeof value !== 'object') return null;
+
+  const plan = value as Partial<TrainingPlan>;
+  if (
+    typeof plan.id !== 'string' ||
+    typeof plan.title !== 'string' ||
+    typeof plan.details !== 'string' ||
+    typeof plan.completed !== 'boolean' ||
+    !isTrainingIntensity(plan.intensity)
+  ) {
+    return null;
+  }
+
+  return {
+    id: plan.id,
+    title: plan.title,
+    details: plan.details,
+    completed: plan.completed,
+    intensity: plan.intensity,
+    ...normalizeTrainingTime(plan.startTime, plan.durationMinutes),
+  };
+};
+
+type WeekPlanLayout = { left: number; width: number };
+
+const getWeekPlanLayouts = (plans: TrainingPlan[]) => {
+  const sorted = [...plans].sort((a, b) => timeToMinutes(a.startTime) - timeToMinutes(b.startTime));
+  const layouts = new Map<string, WeekPlanLayout>();
+  let cluster: TrainingPlan[] = [];
+  let clusterEnd = -1;
+
+  const layoutCluster = () => {
+    if (cluster.length === 0) return;
+
+    const laneEnds: number[] = [];
+    const lanes = new Map<string, number>();
+    cluster.forEach(plan => {
+      const start = timeToMinutes(plan.startTime);
+      const end = start + plan.durationMinutes;
+      let lane = laneEnds.findIndex(laneEnd => laneEnd <= start);
+      if (lane === -1) lane = laneEnds.length;
+      laneEnds[lane] = end;
+      lanes.set(plan.id, lane);
+    });
+
+    const laneCount = Math.max(laneEnds.length, 1);
+    cluster.forEach(plan => {
+      const lane = lanes.get(plan.id) ?? 0;
+      layouts.set(plan.id, {
+        left: (lane / laneCount) * 100,
+        width: 100 / laneCount,
+      });
+    });
+  };
+
+  sorted.forEach(plan => {
+    const start = timeToMinutes(plan.startTime);
+    const end = start + plan.durationMinutes;
+    if (cluster.length > 0 && start >= clusterEnd) {
+      layoutCluster();
+      cluster = [];
+      clusterEnd = -1;
+    }
+    cluster.push(plan);
+    clusterEnd = Math.max(clusterEnd, end);
+  });
+  layoutCluster();
+
+  return layouts;
 };
 
 const readStoredTrainingPlans = (): Record<string, TrainingPlan[]> => {
@@ -206,17 +338,7 @@ const readStoredTrainingPlans = (): Record<string, TrainingPlan[]> => {
       Object.entries(parsed).map(([dateKey, value]) => [
         dateKey,
         Array.isArray(value)
-          ? value.filter((plan): plan is TrainingPlan => {
-              if (!plan || typeof plan !== 'object') return false;
-
-              return (
-                typeof (plan as TrainingPlan).id === 'string' &&
-                typeof (plan as TrainingPlan).title === 'string' &&
-                typeof (plan as TrainingPlan).details === 'string' &&
-                typeof (plan as TrainingPlan).completed === 'boolean' &&
-                ['green', 'blue', 'yellow', 'orange', 'red', 'purple'].includes((plan as TrainingPlan).intensity)
-              );
-            })
+          ? value.map(normalizeStoredTrainingPlan).filter((plan): plan is TrainingPlan => plan !== null)
           : [],
       ])
     );
@@ -247,6 +369,8 @@ const createDefaultTrainingPlans = (baseDate: Date): Record<string, TrainingPlan
         details: '保持轻松心率，最后 1 km 放松慢跑。',
         intensity: 'green',
         completed: false,
+        startTime: '07:00',
+        durationMinutes: 60,
       },
     ],
     [format(addDays(currentMonthStart, 4), 'yyyy-MM-dd')]: [
@@ -256,6 +380,8 @@ const createDefaultTrainingPlans = (baseDate: Date): Record<string, TrainingPlan
         details: '2 km 热身，6 x 800m，间歇慢跑恢复。',
         intensity: 'red',
         completed: false,
+        startTime: '18:00',
+        durationMinutes: 90,
       },
     ],
     [format(addDays(currentMonthStart, 9), 'yyyy-MM-dd')]: [
@@ -265,6 +391,8 @@ const createDefaultTrainingPlans = (baseDate: Date): Record<string, TrainingPlan
         details: '前后各 3 km 轻松，中间 6 km 节奏跑。',
         intensity: 'orange',
         completed: true,
+        startTime: '07:00',
+        durationMinutes: 75,
       },
       {
         id: generateId(),
@@ -272,6 +400,8 @@ const createDefaultTrainingPlans = (baseDate: Date): Record<string, TrainingPlan
         details: '晚间恢复跑，跑后拉伸 10 分钟。',
         intensity: 'green',
         completed: false,
+        startTime: '18:30',
+        durationMinutes: 45,
       },
     ],
     [format(addDays(currentMonthStart, 15), 'yyyy-MM-dd')]: [
@@ -281,6 +411,8 @@ const createDefaultTrainingPlans = (baseDate: Date): Record<string, TrainingPlan
         details: '补给按比赛日模拟，每 40 分钟一次。',
         intensity: 'blue',
         completed: false,
+        startTime: '06:30',
+        durationMinutes: 150,
       },
     ],
   };
@@ -468,9 +600,11 @@ function App() {
   const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set(['root']));
   // View State
   const [currentView, setCurrentView] = useState<'map' | 'editor' | 'calendar'>('map');
+  const [calendarMode, setCalendarMode] = useState<CalendarMode>('month');
   const [currentCalendarMonth, setCurrentCalendarMonth] = useState(new Date());
   const [trainingPlans, setTrainingPlans] = useState<Record<string, TrainingPlan[]>>({});
   const [selectedCalendarDate, setSelectedCalendarDate] = useState<Date | null>(null);
+  const [selectedCalendarTime, setSelectedCalendarTime] = useState(DEFAULT_TRAINING_START_TIME);
 
 
   const [panZoom, setPanZoom] = useState({ x: 50, y: 50, scale: 1 });
@@ -510,6 +644,7 @@ function App() {
 
     if (Object.keys(storedPlans).length > 0) {
       setTrainingPlans(storedPlans);
+      writeStoredTrainingPlans(storedPlans);
       return;
     }
 
@@ -910,19 +1045,23 @@ function App() {
   const updateTrainingPlan = (
     dateKey: string,
     planId: string,
-    field: 'title' | 'details' | 'intensity',
-    value: string
+    field: 'title' | 'details' | 'intensity' | 'startTime' | 'durationMinutes',
+    value: string | number
   ) => {
     const nextPlans = {
       ...trainingPlans,
-      [dateKey]: (trainingPlans[dateKey] ?? []).map(plan =>
-        plan.id === planId
-          ? {
-              ...plan,
-              [field]: value,
-            }
-          : plan
-      ),
+      [dateKey]: (trainingPlans[dateKey] ?? []).map(plan => {
+        if (plan.id !== planId) return plan;
+
+        const updatedPlan = { ...plan, [field]: value } as TrainingPlan;
+        if (field === 'startTime' || field === 'durationMinutes') {
+          return {
+            ...updatedPlan,
+            ...normalizeTrainingTime(updatedPlan.startTime, updatedPlan.durationMinutes),
+          };
+        }
+        return updatedPlan;
+      }),
     };
 
     setTrainingPlans(nextPlans);
@@ -930,6 +1069,7 @@ function App() {
   };
 
   const addTrainingPlan = (dateKey: string) => {
+    const start = normalizeTrainingTime(selectedCalendarTime, DEFAULT_TRAINING_DURATION);
     const nextPlans = {
       ...trainingPlans,
       [dateKey]: [
@@ -940,6 +1080,7 @@ function App() {
           details: '',
           intensity: 'green' as TrainingIntensity,
           completed: false,
+          ...start,
         },
       ],
     };
@@ -959,8 +1100,9 @@ function App() {
     writeStoredTrainingPlans(nextPlans);
   };
 
-  const openCalendarDateSidebar = (date: Date) => {
+  const openCalendarDateSidebar = (date: Date, time = DEFAULT_TRAINING_START_TIME) => {
     setSelectedCalendarDate(date);
+    setSelectedCalendarTime(time);
   };
 
   const updateCalendarMarkerColor = async (color: CalendarMarkerColor) => {
@@ -1122,8 +1264,8 @@ function App() {
   const renderCalendar = () => {
     const monthStart = startOfMonth(currentCalendarMonth);
     const monthEnd = endOfMonth(monthStart);
-    const startDate = startOfWeek(monthStart);
-    const endDate = endOfWeek(monthEnd);
+    const startDate = startOfWeek(monthStart, { weekStartsOn: 1 });
+    const endDate = endOfWeek(monthEnd, { weekStartsOn: 1 });
     const selectedDateKey = selectedCalendarDate ? format(selectedCalendarDate, 'yyyy-MM-dd') : null;
     const selectedDatePlans = selectedDateKey ? trainingPlans[selectedDateKey] ?? [] : [];
 
@@ -1151,49 +1293,44 @@ function App() {
           <div
             key={day.toISOString()}
             onClick={() => openCalendarDateSidebar(cloneDay)}
-            className={`
-              min-h-[120px] cursor-pointer border border-slate-200/80 px-3 py-3 transition-colors
-              ${isCurrentMonth ? 'bg-white' : 'bg-slate-50/70 text-slate-400'}
-              ${hasTraining && isCurrentMonth ? 'bg-sky-50/40' : ''}
-              ${isSelectedDate ? 'relative z-10 border-blue-500 ring-1 ring-blue-500' : ''}
-            `}
+            className={`relative min-h-[138px] cursor-pointer border-b border-r border-[#edf0f5] p-3 text-left transition-colors hover:bg-[#f8faff] sm:min-h-[154px] sm:p-4 ${
+              isCurrentMonth ? 'bg-white' : 'bg-[#fbfcfe] text-slate-300'
+            } ${hasTraining && isCurrentMonth ? 'bg-[#fbfdff]' : ''} ${
+              isSelectedDate ? 'z-10 shadow-[inset_0_0_0_2px_#2563eb]' : ''
+            }`}
           >
             <div className="flex h-full flex-col">
-              <div className="mb-3 flex items-start justify-between">
-                <span className="text-[11px] font-medium text-slate-400">
-                  {hasTraining && isCurrentMonth ? `${completedPlans}/${dayPlans.length} 完成` : '\u00A0'}
+              <div className="mb-3 flex items-center justify-between">
+                <span className="text-[10px] font-semibold uppercase text-[#a6b1c8]">
+                  {hasTraining && isCurrentMonth ? `${completedPlans}/${dayPlans.length}` : '\u00A0'}
                 </span>
-                <span className={`text-xs ${isToday ? 'font-bold text-red-500' : 'font-medium text-slate-400'}`}>
+                <span className={`text-xs ${isToday ? 'font-bold text-red-500' : 'font-semibold text-[#8290ad]'}`}>
                   {format(day, 'd')}
                 </span>
               </div>
 
-              <div className="flex flex-1 flex-col gap-1.5">
+              <div className="flex flex-1 flex-col gap-2">
                 {visiblePlans.map(plan => {
                   const style = TRAINING_INTENSITY_STYLES[plan.intensity];
 
                   return (
-                  <div
-                    key={plan.id}
-                    className={`rounded-md px-2 py-1.5 text-[11px] leading-tight ${style.block} ${plan.completed ? 'opacity-60 line-through' : ''}`}
-                  >
-                    <div className="flex items-center gap-1.5">
-                      <span className={`h-1.5 w-1.5 rounded-full ${style.accent}`} />
-                      <span className="truncate font-medium">{plan.title || 'Untitled'}</span>
-                    </div>
+                  <div key={plan.id} className={`rounded-md border-2 px-2.5 py-2 ${style.block} ${style.border} ${plan.completed ? 'opacity-60' : ''}`}>
+                    <span className={`inline-flex rounded px-1.5 py-0.5 text-[9px] font-bold uppercase ${style.pill}`}>
+                      {plan.completed ? 'Done' : 'Plan'}
+                    </span>
+                    <p className={`mt-1.5 truncate text-[11px] font-semibold ${plan.completed ? 'line-through' : ''}`}>
+                      {plan.title || 'Untitled training'}
+                    </p>
                   </div>
                   );
                 })}
 
                 {hiddenPlanCount > 0 && (
-                  <div className="text-[11px] font-medium text-slate-500">
+                  <div className="px-1 text-[10px] font-semibold text-[#8290ad]">
                     +{hiddenPlanCount} more
                   </div>
                 )}
 
-                {dayPlans.length === 0 && isCurrentMonth && (
-                  <div className="mt-auto text-[11px] text-slate-300">Rest day</div>
-                )}
               </div>
             </div>
           </div>
@@ -1208,101 +1345,323 @@ function App() {
       days = [];
     }
 
-    return (
-      <div className="flex h-screen overflow-hidden bg-[#fcfcfb] text-slate-900 font-sans">
-        <div className="flex min-w-0 flex-1 flex-col">
-        <header className="border-b border-slate-200 bg-[#fcfcfb] px-4 py-4 sm:px-6">
-          <div className="mx-auto flex max-w-7xl flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-            <div className="flex items-center gap-3">
-              <div className="rounded-lg bg-slate-100 p-2 text-slate-600">
-                <Calendar className="h-5 w-5" />
-              </div>
-              <div>
-                <h1 className="text-2xl font-semibold tracking-tight">Running Planner</h1>
-                <p className="text-sm text-slate-500">月度训练安排，专注配速、距离和执行状态。</p>
-              </div>
+    const viewOptions: Array<{ value: 'map' | 'editor' | 'calendar'; label: string }> = [
+      { value: 'map', label: 'Map' },
+      { value: 'editor', label: 'Explorer' },
+      { value: 'calendar', label: 'Calendar' },
+    ];
+    const weekStart = startOfWeek(currentCalendarMonth, { weekStartsOn: 1 });
+    const weekEnd = endOfWeek(currentCalendarMonth, { weekStartsOn: 1 });
+    const weekDays = Array.from({ length: 7 }, (_, index) => addDays(weekStart, index));
+    const weekHours = Array.from({ length: WEEK_END_HOUR - WEEK_START_HOUR }, (_, index) => WEEK_START_HOUR + index);
+    const weekHeight = weekHours.length * WEEK_HOUR_HEIGHT;
+    const currentYear = currentCalendarMonth.getFullYear();
+    const yearMonths = Array.from({ length: 12 }, (_, index) => new Date(currentYear, index, 1));
+
+    const weekTitle = weekStart.getFullYear() !== weekEnd.getFullYear()
+      ? `${format(weekStart, 'MMMM d, yyyy')} – ${format(weekEnd, 'MMMM d, yyyy')}`
+      : weekStart.getMonth() === weekEnd.getMonth()
+        ? `${format(weekStart, 'MMMM d')} – ${format(weekEnd, 'd, yyyy')}`
+        : `${format(weekStart, 'MMMM d')} – ${format(weekEnd, 'MMMM d, yyyy')}`;
+    const calendarTitle = calendarMode === 'year'
+      ? String(currentYear)
+      : calendarMode === 'week'
+        ? weekTitle
+        : format(currentCalendarMonth, 'MMMM yyyy');
+
+    const navigateCalendar = (direction: -1 | 1) => {
+      setSelectedCalendarDate(null);
+      setCurrentCalendarMonth(current => {
+        if (calendarMode === 'year') return direction === 1 ? addYears(current, 1) : subYears(current, 1);
+        if (calendarMode === 'week') return direction === 1 ? addWeeks(current, 1) : subWeeks(current, 1);
+        return direction === 1 ? addMonths(current, 1) : subMonths(current, 1);
+      });
+    };
+
+    const renderMonthView = () => (
+      <div className="min-w-[760px]">
+        <div className="grid grid-cols-7 border-b border-[#edf0f5] bg-white">
+          {['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'].map(weekDay => (
+            <div key={weekDay} className="border-r border-[#edf0f5] px-4 py-4 text-center text-[11px] font-semibold text-[#7182a3] last:border-r-0">
+              {weekDay}
+            </div>
+          ))}
+        </div>
+        <div className="grid grid-cols-7 border-l border-t border-[#edf0f5]">{rows}</div>
+      </div>
+    );
+
+    const renderWeekView = () => {
+      const now = new Date();
+      const nowMinutes = now.getHours() * 60 + now.getMinutes();
+      const showNowLine = isSameWeek(now, currentCalendarMonth, { weekStartsOn: 1 }) &&
+        nowMinutes >= WEEK_START_HOUR * 60 && nowMinutes <= WEEK_END_HOUR * 60;
+      const nowTop = ((nowMinutes - WEEK_START_HOUR * 60) / 60) * WEEK_HOUR_HEIGHT;
+
+      return (
+        <div className="min-w-[900px]">
+          <div className="grid grid-cols-[64px_repeat(7,minmax(110px,1fr))] border-b border-[#edf0f5] bg-white">
+            <div className="grid place-items-center border-r border-[#edf0f5] text-[#a6b1c8]">
+              <Calendar className="h-4 w-4" />
+            </div>
+            {weekDays.map(date => {
+              const isToday = isSameDay(date, now);
+              return (
+                <button
+                  key={date.toISOString()}
+                  type="button"
+                  onClick={() => openCalendarDateSidebar(date)}
+                  className={`border-r border-[#edf0f5] px-3 py-3 text-center last:border-r-0 ${isToday ? 'bg-red-50/40' : ''}`}
+                >
+                  <span className={`text-xs font-semibold ${isToday ? 'text-red-500' : 'text-[#7182a3]'}`}>
+                    {format(date, 'EEE d')}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="flex">
+            <div className="relative w-16 shrink-0 border-r border-[#edf0f5] bg-white" style={{ height: weekHeight }}>
+              {weekHours.map((hour, index) => (
+                <span key={hour} className="absolute right-3 -translate-y-1/2 text-[10px] font-semibold text-[#a6b1c8]" style={{ top: index * WEEK_HOUR_HEIGHT }}>
+                  {String(hour).padStart(2, '0')}:00
+                </span>
+              ))}
             </div>
 
-            <div className="flex flex-wrap items-center gap-3">
-              <div className="flex items-center rounded-lg border border-slate-200 bg-white">
-                <button onClick={() => setCurrentCalendarMonth(subMonths(currentCalendarMonth, 1))} className="p-2 text-slate-500 transition-colors hover:bg-slate-50 hover:text-slate-800"><ChevronLeft className="h-4 w-4" /></button>
-                <span className="min-w-36 px-3 text-center text-sm font-medium text-slate-700 sm:min-w-40">{format(currentCalendarMonth, 'MMMM yyyy')}</span>
-                <button onClick={() => setCurrentCalendarMonth(addMonths(currentCalendarMonth, 1))} className="p-2 text-slate-500 transition-colors hover:bg-slate-50 hover:text-slate-800"><ChevronRightIcon className="h-4 w-4" /></button>
-              </div>
+            <div className="relative grid flex-1 grid-cols-7" style={{ height: weekHeight }}>
+              {weekDays.map(date => {
+                const dateKey = format(date, 'yyyy-MM-dd');
+                const dayPlans = trainingPlans[dateKey] ?? [];
+                const layouts = getWeekPlanLayouts(dayPlans);
 
-              <button
-                onClick={() => setCurrentView('map')}
-                className="rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-700 transition-colors hover:bg-slate-50"
-              >
-                打开 Map
-              </button>
+                return (
+                  <div
+                    key={dateKey}
+                    className="relative border-r border-[#edf0f5] last:border-r-0"
+                    style={{
+                      backgroundImage: `repeating-linear-gradient(to bottom, transparent 0, transparent ${WEEK_HOUR_HEIGHT - 1}px, #edf0f5 ${WEEK_HOUR_HEIGHT - 1}px, #edf0f5 ${WEEK_HOUR_HEIGHT}px)`,
+                    }}
+                    onClick={(event) => {
+                      const rect = event.currentTarget.getBoundingClientRect();
+                      const offset = Math.min(Math.max(event.clientY - rect.top, 0), weekHeight - 1);
+                      const minutes = WEEK_START_HOUR * 60 + Math.round((offset / WEEK_HOUR_HEIGHT) * 4) * 15;
+                      openCalendarDateSidebar(date, minutesToTime(minutes));
+                    }}
+                  >
+                    {dayPlans.map(plan => {
+                      const style = TRAINING_INTENSITY_STYLES[plan.intensity];
+                      const layout = layouts.get(plan.id) ?? { left: 0, width: 100 };
+                      const startMinutes = timeToMinutes(plan.startTime);
+                      const top = ((startMinutes - WEEK_START_HOUR * 60) / 60) * WEEK_HOUR_HEIGHT;
+                      const height = Math.max((plan.durationMinutes / 60) * WEEK_HOUR_HEIGHT, 24);
 
-              <button
-                onClick={() => setCurrentView('editor')}
-                className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-slate-800"
-              >
-                打开 Explorer
-              </button>
+                      return (
+                        <button
+                          key={plan.id}
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            openCalendarDateSidebar(date, plan.startTime);
+                          }}
+                          className={`absolute z-10 overflow-hidden rounded-md border-2 px-2 py-1.5 text-left ${style.block} ${style.border} ${plan.completed ? 'opacity-60' : ''}`}
+                          style={{
+                            top,
+                            height,
+                            left: `calc(${layout.left}% + 4px)`,
+                            width: `calc(${layout.width}% - 8px)`,
+                          }}
+                          title={`${plan.startTime} · ${plan.durationMinutes} min · ${plan.title}`}
+                        >
+                          <span className={`inline-flex rounded px-1 py-0.5 text-[8px] font-bold ${style.pill}`}>{plan.startTime}</span>
+                          <p className={`mt-1 line-clamp-2 text-[10px] font-semibold ${plan.completed ? 'line-through' : ''}`}>{plan.title}</p>
+                        </button>
+                      );
+                    })}
+                  </div>
+                );
+              })}
+
+              {showNowLine && (
+                <div className="pointer-events-none absolute inset-x-0 z-20 border-t-2 border-red-500" style={{ top: nowTop }}>
+                  <span className="absolute -left-1 -top-1.5 h-3 w-3 rounded-full bg-red-500" />
+                </div>
+              )}
             </div>
           </div>
-        </header>
+        </div>
+      );
+    };
 
-        <main className="flex-1 overflow-y-auto px-4 py-5 sm:px-6">
-           <div className="mx-auto flex max-w-7xl flex-col">
-              <div className="border border-slate-200 bg-white">
-                <div className="grid grid-cols-7 border-b border-slate-200">
-                {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(day => (
-                  <div key={day} className="border-r border-slate-200 px-3 py-2 text-left text-[11px] font-medium uppercase tracking-[0.14em] text-slate-400 last:border-r-0 sm:text-xs">
-                    {day}
-                  </div>
-                ))}
-                </div>
+    const renderYearView = () => (
+      <div className="grid grid-cols-1 gap-px bg-[#edf0f5] sm:grid-cols-2 xl:grid-cols-4">
+        {yearMonths.map(month => {
+          const miniStart = startOfWeek(startOfMonth(month), { weekStartsOn: 1 });
+          const miniEnd = endOfWeek(endOfMonth(month), { weekStartsOn: 1 });
+          const miniDays: Date[] = [];
+          let miniDay = miniStart;
+          while (miniDay <= miniEnd) {
+            miniDays.push(miniDay);
+            miniDay = addDays(miniDay, 1);
+          }
+          const monthPrefix = format(month, 'yyyy-MM');
+          const monthPlans = Object.entries(trainingPlans)
+            .filter(([dateKey]) => dateKey.startsWith(monthPrefix))
+            .flatMap(([, plans]) => plans);
+          const completedCount = monthPlans.filter(plan => plan.completed).length;
+          const completionRate = monthPlans.length > 0 ? Math.round((completedCount / monthPlans.length) * 100) : 0;
 
-                <div className="grid grid-cols-7">
-                {rows}
+          return (
+            <section key={monthPrefix} className="min-h-[270px] bg-white p-5">
+              <button
+                type="button"
+                onClick={() => {
+                  setCurrentCalendarMonth(month);
+                  setCalendarMode('month');
+                  setSelectedCalendarDate(null);
+                }}
+                className="flex w-full items-center justify-between text-left"
+              >
+                <span className="text-sm font-semibold text-[#526d9f]">{format(month, 'MMMM')}</span>
+                <span className="text-[10px] font-semibold text-[#a6b1c8]">{monthPlans.length} plans · {completionRate}%</span>
+              </button>
+
+              <div className="mt-4 grid grid-cols-7 text-center text-[9px] font-semibold text-[#a6b1c8]">
+                {['M', 'T', 'W', 'T', 'F', 'S', 'S'].map((label, index) => <span key={`${label}-${index}`}>{label}</span>)}
+              </div>
+              <div className="mt-2 grid grid-cols-7 gap-y-1">
+                {miniDays.map(date => {
+                  const dateKey = format(date, 'yyyy-MM-dd');
+                  const plans = trainingPlans[dateKey] ?? [];
+                  const inMonth = isSameMonth(date, month);
+                  const isToday = isSameDay(date, new Date());
+                  const isSelected = selectedCalendarDate ? isSameDay(date, selectedCalendarDate) : false;
+
+                  return (
+                    <button
+                      key={dateKey}
+                      type="button"
+                      disabled={!inMonth}
+                      onClick={() => {
+                        setCurrentCalendarMonth(date);
+                        setCalendarMode('month');
+                        openCalendarDateSidebar(date);
+                      }}
+                      className={`relative mx-auto grid h-7 w-7 place-items-center rounded text-[10px] ${
+                        !inMonth ? 'invisible' : isToday ? 'font-bold text-red-500' : 'font-medium text-[#7182a3]'
+                      } ${isSelected ? 'ring-2 ring-blue-500' : 'hover:bg-[#f5f7fb]'}`}
+                    >
+                      {format(date, 'd')}
+                      {plans.length > 0 && (
+                        <span className="absolute bottom-0.5 flex gap-0.5">
+                          {plans.slice(0, 2).map(plan => (
+                            <span key={plan.id} className={`h-1 w-1 rounded-full ${TRAINING_INTENSITY_STYLES[plan.intensity].accent}`} />
+                          ))}
+                        </span>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            </section>
+          );
+        })}
+      </div>
+    );
+
+    return (
+      <div className="h-screen overflow-hidden bg-[#edf0f5] p-3 font-sans text-[#344361] sm:p-5 lg:p-7">
+        <div className="mx-auto flex h-full max-w-[1600px] gap-4">
+          <section className="flex min-w-0 flex-1 flex-col overflow-hidden rounded-xl bg-white shadow-[0_18px_50px_rgba(74,91,127,0.10)]">
+            <h1 className="sr-only">Running planner calendar</h1>
+            <header className="grid min-h-[76px] grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-1 border-b border-[#edf0f5] px-2 py-3 sm:min-h-[92px] sm:gap-4 sm:px-5 sm:py-4 lg:px-7">
+              <div className="flex min-w-0 justify-start">
+                <div className="inline-flex h-9 min-w-0 items-center rounded-full border border-[#edf0f5] bg-white p-0.5 shadow-[0_3px_12px_rgba(74,91,127,0.08)] sm:h-10 sm:p-1">
+                  {(['year', 'week', 'month'] as CalendarMode[]).map(mode => (
+                    <button
+                      key={mode}
+                      type="button"
+                      onClick={() => {
+                        setCalendarMode(mode);
+                      }}
+                      className={`h-8 rounded-full px-1 text-[9px] font-semibold transition-colors sm:px-3 sm:text-xs xl:px-4 ${
+                        calendarMode === mode ? 'bg-[#526d9f] text-white' : 'text-[#a6b1c8] hover:text-[#526d9f]'
+                      }`}
+                    >
+                      {mode[0].toUpperCase() + mode.slice(1)}
+                    </button>
+                  ))}
                 </div>
               </div>
-           </div>
-        </main>
-        </div>
 
-        {selectedCalendarDate && (
-          <aside className="w-full max-w-md border-l border-slate-200 bg-white px-5 py-5">
+              <div className="flex shrink-0 items-center justify-center gap-1 sm:gap-4">
+                <button type="button" onClick={() => navigateCalendar(-1)} className="grid h-8 w-8 place-items-center rounded-full border border-[#edf0f5] text-[#a6b1c8] shadow-[0_3px_12px_rgba(74,91,127,0.08)] transition hover:text-[#526d9f] sm:h-10 sm:w-10" title={`Previous ${calendarMode}`}>
+                  <ChevronLeft className="h-4 w-4" />
+                </button>
+                <span className="w-20 truncate text-center text-[10px] font-semibold text-[#526d9f] sm:w-40 sm:text-sm" title={calendarTitle}>{calendarTitle}</span>
+                <button type="button" onClick={() => navigateCalendar(1)} className="grid h-8 w-8 place-items-center rounded-full border border-[#edf0f5] text-[#a6b1c8] shadow-[0_3px_12px_rgba(74,91,127,0.08)] transition hover:text-[#526d9f] sm:h-10 sm:w-10" title={`Next ${calendarMode}`}>
+                  <ChevronRightIcon className="h-4 w-4" />
+                </button>
+              </div>
+
+              <div className="flex min-w-0 justify-end">
+                <div className="inline-flex h-9 min-w-0 items-center rounded-full border border-[#edf0f5] bg-white p-0.5 shadow-[0_3px_12px_rgba(74,91,127,0.08)] sm:h-10 sm:p-1">
+                  {viewOptions.map(option => {
+                    const isActive = currentView === option.value;
+                    return (
+                      <button key={option.value} type="button" onClick={() => setCurrentView(option.value)} className={`flex h-8 items-center justify-center rounded-full px-1.5 text-[9px] font-semibold transition-colors sm:px-3 sm:text-xs ${isActive ? 'bg-[#526d9f] text-white' : 'text-[#a6b1c8] hover:text-[#526d9f]'}`}>
+                        {option.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </header>
+
+            <main className="flex-1 overflow-auto">
+              {calendarMode === 'year' ? renderYearView() : calendarMode === 'week' ? renderWeekView() : renderMonthView()}
+            </main>
+          </section>
+
+          {selectedCalendarDate && (
+          <aside className="fixed inset-x-3 bottom-3 z-50 max-h-[78vh] overflow-hidden rounded-xl bg-white shadow-[0_20px_60px_rgba(45,61,96,0.22)] sm:inset-x-auto sm:right-5 sm:w-[390px] lg:static lg:max-h-none lg:w-[390px] lg:flex-none">
             <div className="flex h-full flex-col">
-              <div className="flex items-start justify-between gap-4 border-b border-slate-200 pb-4">
+              <div className="flex items-start justify-between gap-4 border-b border-[#edf0f5] px-5 py-5">
                 <div>
-                  <p className="text-xs font-medium uppercase tracking-[0.14em] text-slate-400">
-                    {format(selectedCalendarDate, 'EEEE')}
-                  </p>
-                  <h2 className="mt-1 text-xl font-semibold text-slate-900">
+                  <p className="text-xs font-semibold uppercase text-[#a6b1c8]">Training day</p>
+                  <h2 className="mt-1 text-lg font-semibold text-[#344361]">
                     {format(selectedCalendarDate, 'MMMM d, yyyy')}
                   </h2>
-                  <p className="mt-2 text-sm text-slate-500">
-                    {selectedDatePlans.length > 0 ? `共 ${selectedDatePlans.length} 个训练安排` : '当天没有训练安排'}
+                  <p className="mt-1 text-xs text-[#8290ad]">
+                    {selectedDatePlans.length > 0 ? `${selectedDatePlans.length} training item${selectedDatePlans.length > 1 ? 's' : ''}` : 'Rest day'}
                   </p>
                 </div>
                 <button
+                  type="button"
                   onClick={closeCalendarDateModal}
-                  className="rounded-md p-2 text-slate-400 transition-colors hover:bg-slate-50 hover:text-slate-700"
+                  className="grid h-8 w-8 place-items-center rounded-full text-[#a6b1c8] transition hover:bg-[#f5f7fb] hover:text-[#526d9f]"
+                  title="Close sidebar"
                 >
                   <X className="h-4 w-4" />
                 </button>
               </div>
 
-              <div className="flex items-center justify-between border-b border-slate-200 py-3">
-                <p className="text-sm text-slate-500">标题会显示在日历上，具体内容只显示在侧边栏。</p>
+              <div className="flex items-center justify-between border-b border-[#edf0f5] px-5 py-3">
+                <p className="text-xs font-medium text-[#8290ad]">标题显示在日历，内容保留在侧栏</p>
                 <button
                   type="button"
                   onClick={() => selectedDateKey && addTrainingPlan(selectedDateKey)}
-                  className="rounded-md border border-slate-200 px-3 py-1.5 text-sm font-medium text-slate-700 transition-colors hover:bg-slate-50"
+                  className="flex h-8 items-center gap-1.5 rounded-md bg-[#526d9f] px-3 text-xs font-semibold text-white transition hover:bg-[#405b8d]"
                 >
-                  新增事项
+                  <Plus className="h-3.5 w-3.5" />
+                  {calendarMode === 'week' ? `新增 ${selectedCalendarTime}` : '新增'}
                 </button>
               </div>
 
-              <div className="flex-1 space-y-3 overflow-y-auto py-5">
+              <div className="flex-1 space-y-4 overflow-y-auto p-5">
                 {selectedDatePlans.length === 0 && (
-                  <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-6 text-sm text-slate-500">
+                  <div className="rounded-lg border border-dashed border-[#dfe4ed] bg-[#fbfcfe] px-4 py-8 text-center text-sm text-[#8290ad]">
                     今天是休息日，可以安排拉伸、泡沫轴或完全恢复。
                   </div>
                 )}
@@ -1311,27 +1670,24 @@ function App() {
                   const style = TRAINING_INTENSITY_STYLES[plan.intensity];
 
                   return (
-                    <section key={plan.id} className="border border-slate-200 p-4">
+                    <section key={plan.id} className={`rounded-lg border-2 bg-white p-4 ${style.border}`}>
                       <div className="flex items-center justify-between gap-3">
-                        <div className="flex items-center gap-2">
-                          <span className={`h-2 w-2 rounded-full ${style.accent}`} />
-                          <span className={`text-xs font-medium ${style.badge}`}>强度</span>
-                        </div>
+                        <span className={`inline-flex rounded px-2 py-1 text-[10px] font-bold uppercase ${style.pill}`}>{plan.intensity}</span>
                         <button
                           type="button"
                           onClick={() => toggleTrainingPlanCompletion(selectedDateKey!, plan.id)}
-                          className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+                          className={`rounded-md px-2.5 py-1.5 text-xs font-semibold transition-colors ${
                             plan.completed
-                              ? 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
-                              : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                              ? 'bg-emerald-50 text-emerald-700'
+                              : 'bg-[#f5f7fb] text-[#7182a3]'
                           }`}
                         >
-                          {plan.completed ? '已完成' : '未完成'}
+                          {plan.completed ? '已完成' : '标记完成'}
                         </button>
                       </div>
 
                       <div className="mt-4">
-                        <label className="mb-1.5 block text-xs font-medium uppercase tracking-[0.12em] text-slate-400">
+                        <label className="mb-1.5 block text-[10px] font-bold uppercase text-[#a6b1c8]">
                           标题
                         </label>
                         <input
@@ -1339,27 +1695,55 @@ function App() {
                           value={plan.title}
                           onChange={(e) => updateTrainingPlan(selectedDateKey!, plan.id, 'title', e.target.value)}
                           placeholder="例如：Easy Run · 8 km · 5:45/km"
-                          className="w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-800 outline-none transition focus:border-slate-400"
+                          className="w-full border-0 border-b border-[#dfe4ed] bg-transparent px-0 py-2 text-sm font-semibold text-[#344361] outline-none transition focus:border-[#526d9f]"
                         />
                       </div>
 
                       <div className="mt-4">
-                        <label className="mb-1.5 block text-xs font-medium uppercase tracking-[0.12em] text-slate-400">
+                        <label className="mb-1.5 block text-[10px] font-bold uppercase text-[#a6b1c8]">
                           具体内容
                         </label>
                         <textarea
                           value={plan.details}
                           onChange={(e) => updateTrainingPlan(selectedDateKey!, plan.id, 'details', e.target.value)}
                           placeholder="这里只出现在右侧栏，例如训练说明、补给计划、恢复要求等"
-                          className="min-h-[110px] w-full rounded-md border border-slate-200 px-3 py-2 text-sm leading-6 text-slate-700 outline-none transition focus:border-slate-400"
+                          className="min-h-[90px] w-full resize-none rounded-md border border-[#dfe4ed] bg-[#fbfcfe] px-3 py-2 text-sm leading-6 text-[#52617e] outline-none transition focus:border-[#829bd0]"
                         />
                       </div>
 
-                      <div className="mt-4">
-                        <label className="mb-1.5 block text-xs font-medium uppercase tracking-[0.12em] text-slate-400">
-                          强度颜色
+                      <div className="mt-4 grid grid-cols-2 gap-3">
+                        <label className="block">
+                          <span className="mb-1.5 block text-[10px] font-bold uppercase text-[#a6b1c8]">开始时间</span>
+                          <input
+                            type="time"
+                            min="06:00"
+                            max="21:45"
+                            step={900}
+                            value={plan.startTime}
+                            onChange={(event) => updateTrainingPlan(selectedDateKey!, plan.id, 'startTime', event.target.value)}
+                            className="w-full rounded-md border border-[#dfe4ed] bg-[#fbfcfe] px-3 py-2 text-sm font-semibold text-[#52617e] outline-none transition focus:border-[#829bd0]"
+                          />
                         </label>
-                        <div className="flex flex-wrap gap-2">
+                        <label className="block">
+                          <span className="mb-1.5 block text-[10px] font-bold uppercase text-[#a6b1c8]">时长（分钟）</span>
+                          <input
+                            type="number"
+                            min={15}
+                            max={WEEK_END_HOUR * 60 - timeToMinutes(plan.startTime)}
+                            step={15}
+                            value={plan.durationMinutes}
+                            onChange={(event) => updateTrainingPlan(selectedDateKey!, plan.id, 'durationMinutes', Number(event.target.value))}
+                            className="w-full rounded-md border border-[#dfe4ed] bg-[#fbfcfe] px-3 py-2 text-sm font-semibold text-[#52617e] outline-none transition focus:border-[#829bd0]"
+                          />
+                        </label>
+                      </div>
+                      <p className="mt-2 text-[10px] font-medium text-[#a6b1c8]">
+                        {plan.startTime} – {minutesToTime(timeToMinutes(plan.startTime) + plan.durationMinutes)}
+                      </p>
+
+                      <div className="mt-4 flex items-center justify-between gap-3">
+                        <span className="text-[10px] font-bold uppercase text-[#a6b1c8]">强度颜色</span>
+                        <div className="flex items-center gap-2">
                           {(['green', 'blue', 'yellow', 'orange', 'red', 'purple'] as TrainingIntensity[]).map(intensity => {
                             const intensityStyle = TRAINING_INTENSITY_STYLES[intensity];
                             const isActive = plan.intensity === intensity;
@@ -1369,14 +1753,9 @@ function App() {
                                 key={intensity}
                                 type="button"
                                 onClick={() => updateTrainingPlan(selectedDateKey!, plan.id, 'intensity', intensity)}
-                                className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
-                                  isActive
-                                    ? `${intensityStyle.block} ring-1 ring-slate-300`
-                                    : 'border border-slate-200 text-slate-500 hover:bg-slate-50'
-                                }`}
-                              >
-                                {intensity}
-                              </button>
+                                className={`h-5 w-5 rounded-full ${intensityStyle.accent} ${isActive ? 'ring-2 ring-[#526d9f] ring-offset-2' : 'opacity-70 hover:opacity-100'}`}
+                                title={`${intensity} intensity`}
+                              />
                             );
                           })}
                         </div>
@@ -1386,9 +1765,10 @@ function App() {
                         <button
                           type="button"
                           onClick={() => deleteTrainingPlan(selectedDateKey!, plan.id)}
-                          className="rounded-md px-3 py-2 text-sm font-medium text-rose-600 transition-colors hover:bg-rose-50"
+                          className="grid h-8 w-8 place-items-center rounded-md text-[#a6b1c8] transition-colors hover:bg-rose-50 hover:text-rose-600"
+                          title="删除事项"
                         >
-                          删除事项
+                          <Trash2 className="h-4 w-4" />
                         </button>
                       </div>
                     </section>
@@ -1399,6 +1779,7 @@ function App() {
             </div>
           </aside>
         )}
+      </div>
       </div>
     );
   };
@@ -1418,8 +1799,9 @@ function App() {
 
   if (currentView === 'map' && modules.root) {
     return (
-      <div className="h-screen bg-[#f8fafc] text-slate-900 flex flex-col font-sans overflow-hidden">
-        <header className="border-b border-slate-200 bg-white/90 backdrop-blur px-6 py-4 flex items-center justify-between shadow-sm z-10">
+      <div className="h-screen overflow-hidden bg-[#edf0f5] p-3 font-sans text-slate-900 sm:p-5 lg:p-7">
+        <div className="flex h-full flex-col overflow-hidden rounded-xl bg-white shadow-[0_18px_50px_rgba(74,91,127,0.10)]">
+        <header className="z-10 flex min-h-[76px] flex-shrink-0 items-center justify-between border-b border-[#edf0f5] bg-white px-2 sm:min-h-[92px] sm:px-5 lg:px-7">
           <div className="flex items-center gap-3">
             <div className="p-2 bg-blue-100 rounded-lg text-blue-600"><Network className="w-6 h-6" /></div>
             <div>
@@ -1427,9 +1809,10 @@ function App() {
               <p className="text-xs text-slate-500 mt-0.5">Drag to pan, scroll to zoom. Click a node to enter the editor.</p>
             </div>
           </div>
-          <div className="flex items-center gap-2">
-              <button onClick={() => setPanZoom(prev => ({ ...prev, scale: Math.min(prev.scale * 1.2, 3) }))} className="p-2 text-slate-500 hover:bg-slate-200 rounded-lg transition-colors" title="Zoom In"><ZoomIn className="w-5 h-5" /></button>
-              <button onClick={() => setPanZoom(prev => ({ ...prev, scale: Math.max(prev.scale * 0.8, 0.1) }))} className="p-2 text-slate-500 hover:bg-slate-200 rounded-lg transition-colors" title="Zoom Out"><ZoomOut className="w-5 h-5" /></button>
+          <div className="flex items-center gap-3">
+            <div className="flex h-10 items-center rounded-full border border-[#edf0f5] bg-white p-1 shadow-[0_3px_12px_rgba(74,91,127,0.08)]">
+              <button onClick={() => setPanZoom(prev => ({ ...prev, scale: Math.min(prev.scale * 1.2, 3) }))} className="grid h-8 w-8 place-items-center rounded-full text-[#a6b1c8] transition-colors hover:bg-[#f1f5ff] hover:text-[#526d9f]" title="Zoom In"><ZoomIn className="w-4 h-4" /></button>
+              <button onClick={() => setPanZoom(prev => ({ ...prev, scale: Math.max(prev.scale * 0.8, 0.1) }))} className="grid h-8 w-8 place-items-center rounded-full text-[#a6b1c8] transition-colors hover:bg-[#f1f5ff] hover:text-[#526d9f]" title="Zoom Out"><ZoomOut className="w-4 h-4" /></button>
               <button onClick={() => setPanZoom(prev => {
                 if (mapContainerRef.current) {
                   const rect = mapContainerRef.current.getBoundingClientRect();
@@ -1437,19 +1820,28 @@ function App() {
                   return { x: Math.max(50, rect.width * 0.1), y: Math.max(50, rect.height / 2 - treeHeight / 2), scale: 1 };
                 }
                 return { x: 50, y: 50, scale: 1 };
-              })} className="p-2 text-slate-500 hover:bg-slate-200 rounded-lg mr-4 transition-colors" title="Reset View"><Maximize className="w-5 h-5" /></button>
-              <button
-              onClick={() => setCurrentView('editor')}
-              className="px-5 py-2.5 rounded-xl bg-blue-600 text-white font-medium hover:bg-blue-700 transition-colors shadow-sm"
-              >
-                Open Editor View
-              </button>
-              <button
-              onClick={() => setCurrentView('calendar')}
-              className="px-5 py-2.5 rounded-xl bg-indigo-600 text-white font-medium hover:bg-indigo-700 transition-colors shadow-sm ml-4"
-              >
-                Open Calendar
-              </button>
+              })} className="grid h-8 w-8 place-items-center rounded-full text-[#a6b1c8] transition-colors hover:bg-[#f1f5ff] hover:text-[#526d9f]" title="Reset View"><Maximize className="w-4 h-4" /></button>
+            </div>
+            <div className="inline-flex h-10 shrink-0 items-center rounded-full border border-[#edf0f5] bg-white p-1 shadow-[0_3px_12px_rgba(74,91,127,0.08)]">
+              {([
+                { value: 'map', label: 'Map' },
+                { value: 'editor', label: 'Explorer' },
+                { value: 'calendar', label: 'Calendar' },
+              ] as const).map(option => (
+                <button
+                  key={option.value}
+                  type="button"
+                  onClick={() => setCurrentView(option.value)}
+                  className={`flex h-8 items-center justify-center rounded-full px-2 text-[10px] font-semibold transition-colors sm:px-3 sm:text-xs ${
+                    currentView === option.value
+                      ? 'bg-[#526d9f] text-white'
+                      : 'text-[#a6b1c8] hover:text-[#526d9f]'
+                  }`}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
           </div>
         </header>
 
@@ -1528,6 +1920,7 @@ function App() {
             })}
           </div>
         </main>
+        </div>
       </div>
     );
   }
@@ -1555,10 +1948,11 @@ function App() {
       </aside>
 
       {/* Main Content Area */}
-      <div className="flex-1 flex flex-col h-full overflow-hidden relative">
+      <div className="flex-1 h-full overflow-hidden bg-[#edf0f5] p-3 sm:p-5 lg:p-7">
+        <div className="flex h-full flex-col overflow-hidden rounded-xl bg-white shadow-[0_18px_50px_rgba(74,91,127,0.10)]">
         {/* Top Navigation Bar */}
-        <header className="sticky top-0 z-10 bg-white/80 backdrop-blur-md border-b border-gray-200 px-4 py-3 sm:px-6 lg:px-8 flex-shrink-0">
-          <div className="max-w-5xl mx-auto flex items-center justify-between gap-4">
+        <header className="z-10 flex min-h-[76px] flex-shrink-0 items-center border-b border-[#edf0f5] bg-white px-2 sm:min-h-[92px] sm:px-5 lg:px-7">
+          <div className="flex w-full items-center justify-between gap-4">
             <div className="flex items-center overflow-x-auto no-scrollbar gap-1">
             {breadcrumbs.map((crumb, index) => (
               <React.Fragment key={crumb.id}>
@@ -1580,20 +1974,26 @@ function App() {
             ))}
             </div>
 
-            <button
-              onClick={() => setCurrentView('map')}
-              className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold text-slate-700 border border-slate-300 bg-white hover:bg-slate-50 transition-colors shadow-sm ml-4 whitespace-nowrap"
-            >
-              <Network className="w-4 h-4" />
-              Open Map View
-            </button>
-            <button
-              onClick={() => setCurrentView('calendar')}
-              className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold text-white border border-indigo-600 bg-indigo-600 hover:bg-indigo-700 transition-colors shadow-sm ml-4 whitespace-nowrap"
-            >
-              <Calendar className="w-4 h-4" />
-              Open Calendar
-            </button>
+            <div className="ml-3 inline-flex h-10 shrink-0 items-center rounded-full border border-[#edf0f5] bg-white p-1 shadow-[0_3px_12px_rgba(74,91,127,0.08)]">
+              {([
+                { value: 'map', label: 'Map' },
+                { value: 'editor', label: 'Explorer' },
+                { value: 'calendar', label: 'Calendar' },
+              ] as const).map(option => (
+                <button
+                  key={option.value}
+                  type="button"
+                  onClick={() => setCurrentView(option.value)}
+                  className={`flex h-8 items-center justify-center rounded-full px-2 text-[10px] font-semibold transition-colors sm:px-3 sm:text-xs ${
+                    currentView === option.value
+                      ? 'bg-[#526d9f] text-white'
+                      : 'text-[#a6b1c8] hover:text-[#526d9f]'
+                  }`}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
           </div>
         </header>
 
@@ -1808,6 +2208,7 @@ function App() {
             </AnimatePresence>
           </div>
         </main>
+        </div>
       </div>
     </div>
   );

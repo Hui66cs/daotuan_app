@@ -3,8 +3,6 @@
 
 This contains everything you need to run your app locally.
 
-View your app in AI Studio: https://ai.studio/apps/bc8d4073-a74b-4677-bec1-aa0024b6d3e1
-
 ## Run Locally
 
 **Prerequisites:**  Node.js
@@ -12,7 +10,7 @@ View your app in AI Studio: https://ai.studio/apps/bc8d4073-a74b-4677-bec1-aa002
 
 1. Install dependencies:
    `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
+2. Run the app:
    `npm run dev`
-$cos\theta=2\frac{1}{\sqrt{1+k^2}}$
+
+阅读书籍：[丹尼尔斯经典跑步训练法](https://cdn.jsdelivr.net/gh/Hui66cs/daotuan_app@master/bookfile/Daniels.pdf)
